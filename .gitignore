@@ -1,0 +1,46 @@
+﻿# Build outputs
+/build-*/
+/cmake-build-*/
+/out/
+/bin/
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+*.exe
+
+# Local experimental test artifacts
+/tmp_sched_test/*.gguf
+/tmp_sched_test/*.bin
+/tmp_sched_test/*.safetensors
+/tmp_sched_test/*.pt
+/tmp_sched_test/*.pth
+/tmp_sched_test/archive/
+
+# Logs and profiling output
+*.log
+*.err
+*.prof
+
+# Local Visual Studio state
+.vs/
+
+# Local benchmark outputs
+gen_ab_*.txt
+
+# Python cache and temporary files
+__pycache__/
+*.py[cod]
+*.bak*
+*.out
+
+# Local scheduler experiments
+/tmp_sched_test/
+
+/tmp_sched_test/
+/build-x64-windows-msvc-release/
+
+tests/*.obj
+tests/*.exe

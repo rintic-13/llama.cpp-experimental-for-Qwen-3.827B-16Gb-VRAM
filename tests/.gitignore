@@ -1,0 +1,15 @@
+*
+!*.*
+!snapshots/
+!fusion/
+*.o
+ggml-common.h
+**/*.swp
+!peg-parser
+
+# Local build artifacts
+/ggml-turbo-quant.obj
+/test-turbo-quant.exe
+/test-turbo-quant.obj
+/tq_sizeof_dbg.exe
+/tq_sizeof_dbg.obj
