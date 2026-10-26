@@ -1,134 +1,121 @@
-# llama.cpp
+# llama.cpp Fork — Build and VRAM Optimizations
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+Experimental fork focused on running Qwen 3.8 27B IQ3_S with reduced VRAM usage and asynchronous CPU-to-GPU weight transfers.
 
-<div align="center">
+## 1. Build recipe
 
-<b>LLM inference in C/C++</b>
+### Working configuration
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+- Windows x64, Visual Studio 2022 MSVC, CUDA Toolkit 13.2
+- CMake + Ninja
+- `CMAKE_BUILD_TYPE=RelWithDebInfo`
+- CUDA enabled
+- `GGML_CUDA_FORCE_CUBLAS=OFF`
+- `GGML_CUDA_FORCE_MMQ=OFF` — leave backend selection to the normal runtime logic; MMQ is the baseline path.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+Run from an x64 Visual Studio developer environment with `vcvars64.bat` initialized.
 
-</div>
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 
-## Quick start
+cmake -S . -B build-x64-windows-msvc-release -G Ninja ^
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo ^
+  -DGGML_CUDA=ON ^
+  -DGGML_CUDA_FORCE_CUBLAS=OFF ^
+  -DGGML_CUDA_FORCE_MMQ=OFF ^
+  "-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;q8_0-q4_0;q5_1-q5_1;q5_1-q4_1;q5_1-q4_0;q4_1-q4_1;f16-f16;q5_1-turbo4_0;q5_1-turbo3_0;turbo4_0-turbo3_0"
 
-A few options to get `llama.cpp` installed on your machine:
-
-```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
-
-# powershell
-irm https://llama.app/install.ps1 | iex
+cmake --build build-x64-windows-msvc-release --parallel
 ```
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+The FA quantization list above is taken from the working CMake cache. Keep the custom Turbo combinations when reconfiguring.
 
-Once installed:
+### Build scripts and incremental-build caveat
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+The repository also provides:
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bat
+rebuild.cmd cuda
+rebuild.cmd fa
+rebuild.cmd all
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Use `cmake --build` for a normal incremental build. Use the relevant `rebuild.cmd` mode when its specialized rebuild behavior is required.
 
-## Description
+**Ninja caveat:** changes to headers that are not correctly tracked by generated dependency rules can leave stale objects in an incremental build. After changing shared headers or CUDA kernel definitions, verify the rebuild output; if necessary, perform a clean rebuild.
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+### Verify Flash Attention kernels
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+Check the effective configuration:
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+```powershell
+Select-String build-x64-windows-msvc-release\CMakeCache.txt `
+  -Pattern "GGML_CUDA_FA_QUANTS|GGML_CUDA_FORCE_CUBLAS|GGML_CUDA_FORCE_MMQ"
+```
 
-## Supported backends
+This confirms the configured options, **not** that every requested kernel was compiled. Inspect the actual build output for the expected FA kernel compilation and any unsupported quantization-pair warnings. Test the resulting binary with the intended KV types as well.
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+### Baseline
 
-## Documentation
+- **832–838 tokens/s prefill** at `-ub 512` in the working configuration.
+- MMQ is the baseline backend.
+- Treat this as a configuration-specific measurement, not a universal llama.cpp benchmark.
 
-#### Tools
+## 2. VRAM reduction and performance features
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+### CPU FFN donors — `select_cpu_donors`
 
-#### Development
+Selected FFN weights are kept in host buffers rather than permanently occupying VRAM. The required data is transferred to the GPU over H2D as inference progresses.
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+This is the main VRAM-capacity lever. Its trade-off is recurring transfer traffic during generation.
 
-## Contributing
+### Scheduler prefetch ring — `GGML_SCHED_*`
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+Experimental scheduler changes coordinate prefetch slots and H2D cells, including:
 
-## Acknowledgements
+- `[PREFETCH_WINDOW]` — automatic prefetch depth.
+- Burst scheduling and transfer chunking.
+- `[PIN]` — host-memory pinning path.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+**Warning:** automatic prefetch depth is known to perform poorly with MTP in some configurations. Validate it with the actual draft model and workload instead of assuming automatic selection is optimal.
+
+### Turbo KV cache — `turbo2`, `turbo3`, `turbo4`
+
+Custom KV-cache quantization paths reduce cache storage and potentially attention data traffic. FA quantization combinations must match the intended K/V types and the kernels actually compiled into the binary.
+
+### IQ3_S MMQ optimization — `IQ3S_SIGN_SWAR`
+
+Custom sign-processing optimization in the IQ3_S MMQ path.
+
+### Fused CPU dot products — `GGML_CPU_Q4K_FUSED_DOTS`
+
+Experimental fused x2/x3 CPU dot-product paths for supported Q4_K workloads.
+
+### Allocation-size expansion — `TAG_ALLOC_SIZE_EXPAND`
+
+Custom allocation-size handling intended to support the fork's modified memory-management paths.
+
+## 3. Retired experiments
+
+The following experimental approaches are no longer exposed as supported CLI features:
+
+- **2A — MoE residency**
+- **2B — host rows / `IQ3_S_FLAT3`**
+
+The CLI rejects these options. The experimental material has been retained under `tmp_sched_test\archive\`; it has not been deleted.
+
+These are archived experiments, not supported runtime modes.
+
+## 4. Benchmark matrix
+
+Current baseline:
+
+| Test | Result |
+|---|---:|
+| Prefill, `-ub 512` | 938 tokens/s |
+| 8k-context generation | 58 |
+| 64k-context generation | 42 |
+| Original llama.cpp comparison | 12 |
+
+For meaningful comparisons, use the same model file, prompt, context length, GPU-layer configuration, KV-cache types, MTP settings and measurement interval. Record prefill and generation separately, and include peak VRAM usage.
+
