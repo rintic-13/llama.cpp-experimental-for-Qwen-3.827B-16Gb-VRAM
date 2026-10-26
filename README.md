@@ -1,6 +1,8 @@
 # llama.cpp Fork — Build and VRAM Optimizations
 
-Experimental fork focused on running Qwen 3.8 27B IQ3_S with reduced VRAM usage and asynchronous CPU-to-GPU weight transfers.
+Experimental fork focused on running Qwen3.8-27B-IQ3_S, Qwen3.8-27B-UD-IQ4_XS i with reduced VRAM usage and asynchronous CPU-to-GPU weight transfers and using a context of up to 200k. Tested on RTX5060ti 16GB, A build with MMQ CUDA allows for the use of a small upload batch size -ub 512 with a maximum prefill, while saving VRAM. 
+Launch command llama-server.exe -m "path_model.gguf" -ngl 99 -c 150000 -b 2048 -ub 512 -np 1 -t 7 -ctk q5_1 -ctv turbo3 -lm mmap -ctxcp 0 -cram 0 -lv 3 --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 4 --ffn-cpu-count 26
+If more aggressive cache compression or the use of a 4-bit quantized model is required, you can apply quantization using the parameters `-ctk turbo4 -ctv turbo3`. Decoding speeds range from 60 tokens/s with a small context to 35 tokens/s when the context is filled to 70,000 tokens. These figures were verified using tasks related to writing program code.
 
 ## 1. Build recipe
 
@@ -79,9 +81,9 @@ Experimental scheduler changes coordinate prefetch slots and H2D cells, includin
 
 **Warning:** automatic prefetch depth is known to perform poorly with MTP in some configurations. Validate it with the actual draft model and workload instead of assuming automatic selection is optimal.
 
-### Turbo KV cache — `turbo2`, `turbo3`, `turbo4`
+### Turboquant KV cache — `turbo2`, `turbo3`, `turbo4`
 
-Custom KV-cache quantization paths reduce cache storage and potentially attention data traffic. FA quantization combinations must match the intended K/V types and the kernels actually compiled into the binary.
+Turboquant KV-cache quantization paths reduce cache storage and potentially attention data traffic. FA quantization combinations must match the intended K/V types and the kernels actually compiled into the binary.
 
 ### IQ3_S MMQ optimization — `IQ3S_SIGN_SWAR`
 
