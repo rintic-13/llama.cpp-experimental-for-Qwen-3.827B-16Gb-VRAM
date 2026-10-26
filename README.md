@@ -59,7 +59,7 @@ This confirms the configured options, **not** that every requested kernel was co
 
 ### Baseline
 
-- **832–838 tokens/s prefill** at `-ub 512` in the working configuration.
+- **938 tokens/s prefill** at `-ub 512` in the working configuration.
 - MMQ is the baseline backend.
 - Treat this as a configuration-specific measurement, not a universal llama.cpp benchmark.
 
