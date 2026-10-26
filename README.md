@@ -69,7 +69,7 @@ This confirms the configured options, **not** that every requested kernel was co
 
 Selected FFN weights are kept in host buffers rather than permanently occupying VRAM. The required data is transferred to the GPU over H2D as inference progresses.
 
-This is the main VRAM-capacity lever. Its trade-off is recurring transfer traffic during generation.
+This is the main VRAM-capacity lever. Its trade-off is recurring transfer traffic during generation. The `--ffn-cpu-count` parameter specifies the number of FFN tensors to offload from VRAM. Adjust this setting based on the load on your VRAM. Also, when populating the VRAM or expanding the context, you can change the cache quantization.
 
 ### Scheduler prefetch ring — `GGML_SCHED_*`
 
