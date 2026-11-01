@@ -841,6 +841,44 @@ Follow-up (same day): GGML_CUDA_FATTN_VEC_KQ_MMA_F16 switched to DEFAULT ON (opt
 would otherwise silently pick up the new default). Repository placed under git (initial commit
 d13246b: fork baseline + all nvfp4 fused work; build/model/log dirs gitignored).
 
+### 10j. The 10h PRMT+dp4a dot rewrite was numerically WRONG (2026-11-02)
+
+First PPL after the 10h dot rewrite (fa_comp_20261102_015717, Chunks-4, quick set):
+nvfp4-DOT PPL = 9.3682 (chunk sequence [10.7803, 10.4235, 9.0482, 9.3682]) vs 5.5052 for the old
+LUT dot (fa_comp_20261101_225351) at the same settings. Fused +0.0209, q4_1 +0.0108, gold 5.5128,
+fused gate PASS - the anomaly was dot-only, and dot's KQ side is the only code fused does not use.
+
+The 10h int8 SIMD decoder had a nibble-lane mispairing. A PRMT instruction consumes only SELECTOR
+NIBBLES 0..3 (bits 0..15 of the selector). The rewrite set `sel = bs & 0x07070707` on the shifted
+4-byte window bs, i.e. nibbles 0..3 of bs = [coord c, coord c+8, coord c+1, coord c+9] (the high
+nibble of each nvfp4 storage byte is coord +8, not the next word coord). u4/v4 byte lanes therefore
+held K coords [c, c+8, c+1, c+9] while the q8_1 word lanes (per-thread interleaved staging,
+Q_i32[j][k_KQ_0/nthreads] = Qq word k_KQ) hold Q coords [c, c+1, c+2, c+3]: dp4a multiplied 3 of
+4 lanes against the WRONG K coordinate, and sumc summed the wrong coordinate set. The old scalar
+LUT body extracted one byte at a time (`byte = (b >> 8t) & 0xFF; lut[byte >> sh & 0xF]`), which is
+immune to this - hence the regression appeared exactly with the rewrite.
+(The earlier §10g suspicion of the dequantize_V_nvfp4 pack line `(s & 0x0F) | ((s >> 4) & 0xF0)`
+was a FALSE lead: (s >> 4) & 0xF0 selects bits 8-11 of s = the low nibble of the NEXT storage byte
+= coord c+1. V packing is consecutive-coord and correct - consistent with fused PPL being healthy.)
+
+Host intdiff (fa_nvfp4_dot_intdiff, §10h) missed this because it emulated the decoder sequence
+including the same wrong sel indexing instead of the coordinate semantics.
+
+Fix: pack the 4 word coords (the EVEN nibbles of bs, i.e. low nibble of each byte) into selector
+nibbles 0..3 before the PRMT: `pk = (bs & 0x000F000F) | ((bs >> 4) & 0x00F000F0); sel = (pk | pk
+>> 8) & 0x00007777;` (+~6 int ops/word, still far cheaper than the old LUT gather). Sign mask sn4
+and the vadd4 sumc tree are unchanged and now lane-align with u4.
+
+Verification tool: tools/fa_nvfp4_devdiff.cu device probe (built twice: fa_nvfp4_devdiff_buggy.exe
+against the pre-fix header, fa_nvfp4_devdiff.exe against the fixed one; user-run):
+(A) old-LUT dot vs current dot on random KV rows, bitwise float compare; (B) dequantize_V_nvfp4
+vs consecutive-coord and (c,c+8) host references + the historical 10f PRMT pair path;
+(C) old-LUT dot vs correct host KQ reference. Expected: buggy build FAILS (A)/(C), fixed build
+passes all; (B) should PASS against the consecutive reference in both builds.
+
+PPL gate after fix (user run): nvfp4-dot quick Chunks-1 back to 7.1289, Chunks-4 full-set
+sequence [7.1289, 6.9060, 5.4756, 5.5052]-class, |dot-gold| <= ~0.01.
+
 ## Reproduce
 
 ```
@@ -863,6 +901,9 @@ cl /O2 /std:c++17 tools\fa_nvfp4_dot_intdiff.cu /Fe:build...\bin\fa_nvfp4_dot_in
 nvcc -O3 --generate-code=arch=compute_120a,code=[sm_120a] -I ggml\include -I ggml\src tools\fa_vec_ab_probe.cu -o build...\bin\fa_vec_ab_probe.exe
 fa_vec_ab_probe.exe         # production flash_attn_ext_vec timing A/B/C/D/E at nq=1/D=256/nkv=32768 (§10h)
                             # decoder codepath A/B: add -DGGML_CUDA_FORCE_E2M1_PRMT for the PRMT variant (§10i)
+tools\fa_nvfp4_devdiff.cu   # device diff: old-LUT dot vs current dot + V-dequant reference matrix (§10j);
+                            # build both fa_nvfp4_devdiff_buggy.exe (pre-fix) and fa_nvfp4_devdiff.exe (fixed)
+                            # via build_devdiff.cmd [outname], run standalone (~100 MB VRAM)
 cuobjdump.exe -sass -fun <mangled kernel name> build...\bin\ggml-cuda.dll   # per-kernel SASS forensics (§10i);
                             # mangled names via: cuobjdump -sass ggml-cuda.dll | findstr "Function : .*flash_attn_ext_vec"
 ```

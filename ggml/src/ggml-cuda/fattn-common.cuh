@@ -1117,15 +1117,18 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
         // sub-block factors out of both the dot and the group-mean term (turbo4 pattern):
         // sum += d_sub * (Q_ds.x * sum(q8*code) + (Q_ds.y/QK8_1) * sum(code))
         // Register decode instead of the kvalues_fp4 constant-LUT gather (divergent constant
-        // loads serialized the loop - probe fa_vec_ab_probe: nvfp4 KQ was ~1.6x q4_1 KQ):
-        //   u4 = table{0,1,2,3,4,6,8,12}[code&7] via one PRMT, sign applied with SIMD
-        //   mask/negate. All integers, so doti/sumc equal the old int8 expressions EXACTLY
-        //   (small exact sums), keeping this dot bitwise-identical (kvalues_fp4[8] = +0 maps
-        //   to -0 -> 0 under two's-complement negate, same value).
+        // loads serialized the loop - probe fa_vec_ab_probe: nvfp4 KQ was ~1.6x q4_1 KQ).
+        // NB (2026-11-02, §10j): PRMT consumes only SELECTOR NIBBLES 0..3 (= bits 0..15).  The
+        // first revision read the 4 coordinate codes from nibbles 0..3 of the shifted window,
+        // which is [coord c, coord c+8, coord c+1, coord c+9] (nibbles 1,3 are the OTHER half of
+        // each storage byte) - dp4a then paired Q coords c..c+3 with K coords c,c+8,c+1,c+9.
+        // Device diff fa_nvfp4_devdiff: ~100% of lanes differ, PPL 9.37 vs 5.51.  The 4 word
+        // coords are the EVEN nibbles of bs (low nibble of each byte); pack them first:
         const int      sh  = (iw & 2) ? 4 : 0;
-        const uint32_t bs  = b >> sh;                                  // this word's nibbles at bits 0..3
-        const uint32_t sel = bs & 0x07070707u;                         // magnitude index per byte
-        const uint32_t sn4 = bs & 0x08080808u;                         // sign bit per byte
+        const uint32_t bs  = b >> sh;                                  // coord codes at bits 0-3,8-11,16-19,24-27
+        const uint32_t sn4 = bs & 0x08080808u;                         // sign bit per coord byte
+        const uint32_t pk  = (bs & 0x000F000Fu) | ((bs >> 4) & 0x00F000F0u);  // coords c,c+1 | c+2,c+3 into 16-bit halves
+        const uint32_t sel = (pk | (pk >> 8)) & 0x00007777u;           // codes c..c+3 in selector nibbles 0..3
         const uint32_t u4  = __byte_perm(0x03020100u, 0x0C080604u, sel); // magnitudes 0,1,2,3 | 4,6,8,12
         const uint32_t m4  = __vcmpgts4((int) sn4, 0);                   // 0xFF where negative
         const uint32_t v4  = __vsub4(u4 ^ m4, m4);                     // signed byte lanes = kv values
