@@ -841,6 +841,13 @@ Follow-up (same day): GGML_CUDA_FATTN_VEC_KQ_MMA_F16 switched to DEFAULT ON (opt
 would otherwise silently pick up the new default). Repository placed under git (initial commit
 d13246b: fork baseline + all nvfp4 fused work; build/model/log dirs gitignored).
 
+Follow-up 2 (same day, build integration): the fused KQ default became a real build switch -
+cmake option GGML_CUDA_FATTN_VEC_KQ_MMA_F16 (ggml/CMakeLists.txt, default ON) ->
+GGML_CUDA_FATTN_VEC_KQ_MMA_F16_DEFAULT compile definition (ggml-cuda/CMakeLists.txt), read by
+ggml_cuda_fattn_vec_kq_mma_f16_enabled(); the env var stays as a pure runtime override for A/B.
+FA_QUANTS list carries the two production nvfp4 combos: nvfp4-nvfp4 (memory, 0.5625 B/c) and
+q5_1-nvfp4 (quality: integer q5_1 K dot + nvfp4 V), plus f16-nvfp4 for the bf16/f16-K path.
+
 ### 10j. The 10h PRMT+dp4a dot rewrite was numerically WRONG (2026-11-02)
 
 First PPL after the 10h dot rewrite (fa_comp_20261102_015717, Chunks-4, quick set):

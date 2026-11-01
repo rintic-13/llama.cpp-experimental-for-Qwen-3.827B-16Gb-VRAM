@@ -152,6 +152,16 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_FA)
     endif()
 
+    # Compile-time default for the fused NVFP4 f16-MMA KQ^T in the flash-attn vec kernel (the
+    # kernel itself lives in fattn-vec.cuh / fattn-common.cuh and is instantiated by the nvfp4
+    # FA combos above). The GGML_CUDA_FATTN_VEC_KQ_MMA_F16 env var overrides it at runtime
+    # (0 = integer dp4a dot fallback, for A/B and debugging).
+    if (GGML_CUDA_FATTN_VEC_KQ_MMA_F16)
+        add_compile_definitions(GGML_CUDA_FATTN_VEC_KQ_MMA_F16_DEFAULT=1)
+    else()
+        add_compile_definitions(GGML_CUDA_FATTN_VEC_KQ_MMA_F16_DEFAULT=0)
+    endif()
+
     if (GGML_CUDA_NO_PEER_COPY)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()

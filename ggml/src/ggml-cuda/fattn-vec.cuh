@@ -22,13 +22,18 @@ static bool ggml_cuda_fattn_vec_kq_mma_enabled() {
 // tokens, n = up to 8 query rows).  Probe-validated numerics: K stays codec-exact, Q error is
 // f16 rounding only (score rms 3e-6 against the f16 reference; see NVFP4_FA_RESEARCH.md SS10).
 // Takes precedence over GGML_CUDA_FATTN_VEC_KQ_MMA when both are set.
-// DEFAULT ON since 2026-11-02: the fused decode+mma KQ met the speed gate against the q4_1
-// integer-dot etalon (+0.2% @8K / +0.1% @32K, fa_comp_20261102_010329) with probe-proven
-// bit-exact decoders, so it adds no numeric risk vs the dot path. Set
-// GGML_CUDA_FATTN_VEC_KQ_MMA_F16=0 to fall back to the integer dp4a dot (A/B, debugging).
+// COMPILE-TIME default since 2026-11-02: cmake option GGML_CUDA_FATTN_VEC_KQ_MMA_F16 (ON by
+// default once the fused decode+mma KQ met the speed gate vs the q4_1 integer-dot etalon,
+// +0.2% @8K / +0.1% @32K, fa_comp_20261102_010329, decoders probe-proven bit-exact).
+// Runtime env GGML_CUDA_FATTN_VEC_KQ_MMA_F16=0/1 overrides either way (0 = integer dp4a dot
+// fallback, A/B and debugging).
+#ifndef GGML_CUDA_FATTN_VEC_KQ_MMA_F16_DEFAULT
+#define GGML_CUDA_FATTN_VEC_KQ_MMA_F16_DEFAULT 1
+#endif
 static bool ggml_cuda_fattn_vec_kq_mma_f16_enabled() {
     static const bool val = [] (const char * v) {
-        return v == nullptr || (v[0] != '0' && v[0] != '\0');
+        if (v != nullptr) return v[0] != '0' && v[0] != '\0';
+        return GGML_CUDA_FATTN_VEC_KQ_MMA_F16_DEFAULT != 0;
     }(getenv("GGML_CUDA_FATTN_VEC_KQ_MMA_F16"));
     return val;
 }
