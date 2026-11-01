@@ -876,8 +876,16 @@ vs consecutive-coord and (c,c+8) host references + the historical 10f PRMT pair 
 (C) old-LUT dot vs correct host KQ reference. Expected: buggy build FAILS (A)/(C), fixed build
 passes all; (B) should PASS against the consecutive reference in both builds.
 
-PPL gate after fix (user run): nvfp4-dot quick Chunks-1 back to 7.1289, Chunks-4 full-set
-sequence [7.1289, 6.9060, 5.4756, 5.5052]-class, |dot-gold| <= ~0.01.
+PPL verification after the fix (fa_comp_pplq_20261102, quick set, Chunks-1, user run):
+nvfp4-dot = 7.1289 - IDENTICAL to the pre-10h LUT-dot value (deterministic PPL => bitwise
+regression closed); nvfp4 default-env == explicit-1 == 7.1607 (default-ON confirmed); q4_1 7.1306;
+fp16-gold 7.1378; fused +0.0229 vs gold (quick-set spot check). Full Chunks-4 sequence
+[7.1289, 6.9060, 5.4756, 5.5052]-class expected.
+
+Probe note: the first devdiff builds exited silently after the header line - the probe itself
+passed HOST pointers as kernel output buffers (illegal access). Fixed (device out buffers +
+unbuffered stdout); fa_nvfp4_devdiff_buggy.exe / fa_nvfp4_devdiff.exe rebuilt from the pre-10j
+(fed3fae) and fixed headers respectively.
 
 ## Reproduce
 

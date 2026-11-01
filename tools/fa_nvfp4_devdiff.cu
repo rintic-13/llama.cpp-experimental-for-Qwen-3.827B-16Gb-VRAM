@@ -120,9 +120,14 @@ static uint32_t ref_half2(const block_nvfp4 & blk, int c0, int e0, int e1) {
 template <int D>
 static void run_dot(const char * Kc, const int * Qq, const float2 * Qds) {
     std::vector<float> oldo((size_t)NROW*32), newo((size_t)NROW*32);
-    k_dot<D,32,false><<<NROW,32>>>(Kc, Qq, Qds, oldo.data());
-    k_dot<D,32,true ><<<NROW,32>>>(Kc, Qq, Qds, newo.data());
+    float *d_o, *d_n;
+    CK(cudaMalloc(&d_o, oldo.size()*4)); CK(cudaMalloc(&d_n, newo.size()*4));
+    k_dot<D,32,false><<<NROW,32>>>(Kc, Qq, Qds, d_o);
+    k_dot<D,32,true ><<<NROW,32>>>(Kc, Qq, Qds, d_n);
     CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+    CK(cudaMemcpy(oldo.data(), d_o, oldo.size()*4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(newo.data(), d_n, newo.size()*4, cudaMemcpyDeviceToHost));
+    cudaFree(d_o); cudaFree(d_n);
     long diff = 0;
     for (size_t i = 0; i < oldo.size() && diff < 3; ++i) {
         uint32_t a, b2; float fa = oldo[i], fb = newo[i];
@@ -134,6 +139,7 @@ static void run_dot(const char * Kc, const int * Qq, const float2 * Qds) {
 }
 
 int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     printf("GPU probe: nvfp4 KQ-dot old/new + V-dequant reference matrix\n");
     srand(20261102);
     const int D = 256;                       // model head size; row = 144 B = 4 blocks*36B
@@ -162,9 +168,14 @@ int main() {
 
     // V: 144B rows, 256 coords, 128 half2 slots
     std::vector<uint32_t> vnew((size_t)NROW*128), vhist((size_t)NROW*128);
-    k_v_new<2,false><<<NROW,128>>>((const char*)dK, vnew.data());
-    k_v_new<2,true ><<<NROW,128>>>((const char*)dK, vhist.data());
+    uint32_t *d_vn, *d_vh;
+    CK(cudaMalloc(&d_vn, vnew.size()*4)); CK(cudaMalloc(&d_vh, vhist.size()*4));
+    k_v_new<2,false><<<NROW,128>>>((const char*)dK, d_vn);
+    k_v_new<2,true ><<<NROW,128>>>((const char*)dK, d_vh);
     CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+    CK(cudaMemcpy(vnew.data(),  d_vn, vnew.size()*4,  cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(vhist.data(), d_vh, vhist.size()*4, cudaMemcpyDeviceToHost));
+    cudaFree(d_vn); cudaFree(d_vh);
 
     long new_vs_hist = 0, new_vs_consec = 0, new_vs_c8 = 0;
     int shown = 0;
