@@ -836,6 +836,11 @@ decoder beats the integer dp4a dot at equal 144 B/token. Speed objective CLOSED;
 the PPL parity table (fused must stay within 0.05 of the unfused nvfp4 PPL - expected bit-stable,
 decoder swaps were probe-proven bitwise) and an optional decision to default the fused flag on.
 
+Follow-up (same day): GGML_CUDA_FATTN_VEC_KQ_MMA_F16 switched to DEFAULT ON (opt-out: set it to
+"0"); the harness therefore sets 0/1 explicitly per row (PowerShell's "" deletes the variable and
+would otherwise silently pick up the new default). Repository placed under git (initial commit
+d13246b: fork baseline + all nvfp4 fused work; build/model/log dirs gitignored).
+
 ## Reproduce
 
 ```
