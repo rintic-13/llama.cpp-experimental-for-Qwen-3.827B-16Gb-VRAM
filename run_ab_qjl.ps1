@@ -1,4 +1,7 @@
 # =============================================================================
+# ARCHIVED 2026-11-02: turbo4q_0 retired from the FA path (worse PPL class, branch buried,
+# NVFP4_FA_RESEARCH.md SS12).  Rows below involving turbo4q no longer hit a native vec kernel
+# on current builds (f16-scratch fallback) - kept only as the historical QJL quality record.
 # run_ab_qjl.ps1 - A/B comparison: TurboQuant Q_prod (turbo3q/turbo4q, MSE +
 # 1-bit QJL residual sign) vs the MSE-only turbo types, via run_ppl_kv.ps1.
 #

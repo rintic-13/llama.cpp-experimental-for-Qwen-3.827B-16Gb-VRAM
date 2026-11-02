@@ -39,15 +39,17 @@ static bool ggml_cuda_fattn_vec_kq_mma_f16_enabled() {
 }
 
 // S2 (2026-11-02): the same fused f16-MMA KQ^T machinery for the TURBO K types (TURBO4_0 /
-// TURBO5_0 / TURBO4Q_0).  K stays in the raw turbo cache bytes (mux centroid decode + dither +
-// norm folded into the f16 A fragments), Q is the same unquantized f32->f16 B fragment set.
+// TURBO5_0).  K stays in the raw turbo cache bytes (mux centroid decode + dither + norm folded
+// into the f16 A fragments), Q is the same unquantized f32->f16 B fragment set.
 // Unlike nvfp4 the turbo numerics change vs the q8_1 dot path (f16 rounding of K*norm and Q),
 // so the compile default is OFF until the PPL gate passes; env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=1
 // turns it on for probing (0 forces the q8_1 dot path if the default flips).
 // SPEED GATE (fa_turbo_ab_probe, idle GPU, §12): fused beats the q8_1 dot only for the dither-free
-// heavy-K decoders (turbo5 -12%, turbo4q -13%); for TURBO4_0 K the 4-lane subtractive dither makes
-// fused 35% (D256) / 71% (D128) SLOWER than the dot+range-dither path, so the runtime selector
-// excludes turbo4 unless GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1 (experiment override).
+// heavy-K decoders (turbo5 -12%); for TURBO4_0 K the 4-lane subtractive dither makes fused 35%
+// (D256) / 71% (D128) SLOWER than the dot+range-dither path, so the runtime selector excludes
+// turbo4 unless GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1 (experiment override).
+// turbo4q_0 K was retired from the FA path on 2026-11-02 (worse PPL class than the turbo4/turbo3
+// combos - the branch was buried, see §12).
 #ifndef GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT
 #define GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT 0
 #endif
@@ -77,7 +79,7 @@ static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag(
         const char * __restrict__ Kb0, const char * __restrict__ Kb1,
         const int f, const int tg, const uint32_t seed0, const uint32_t seed1,
         uint32_t A[4]) {
-    static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO4Q_0,
+    static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0,
                   "turbo kq_afrag: unsupported type_K");
 
     const int cc = f & 7;   // 16-coord chunk inside the 128-coord block
@@ -152,47 +154,6 @@ static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag(
         A[1] = *(const uint32_t *) &h10;
         A[2] = *(const uint32_t *) &h01;
         A[3] = *(const uint32_t *) &h11;
-    } else {
-        const block_turbo4q_0 * b0 = (const block_turbo4q_0 *) Kb0;
-        const block_turbo4q_0 * b1 = (const block_turbo4q_0 *) Kb1;
-
-        const float n0   = __half2float(b0->norm);
-        const float n1   = __half2float(b1->norm);
-        const float qj0  = TURBO_QJL_ALPHA * __half2float(b0->rnorm);
-        const float qj1  = TURBO_QJL_ALPHA * __half2float(b1->rnorm);
-
-        // 3-bit index like turbo3_0: lo2 in qs byte j/4 at bits (j%4)*2, hi1 bit; qjl sign in its
-        // own bit array.  For the coord pair (16cc+2tg, +1): qs byte 4cc + (tg>>1) bits 4*(tg&1)
-        // (coord+1 is the adjacent 2-bit field), hi1/signs byte 2cc(+1) bits 2tg(+1).
-        const uint8_t qq0 = b0->qs[4*cc + (tg >> 1) + 0];
-        const uint8_t qq1 = b0->qs[4*cc + (tg >> 1) + 2];
-        const uint8_t qq2 = b1->qs[4*cc + (tg >> 1) + 0];
-        const uint8_t qq3 = b1->qs[4*cc + (tg >> 1) + 2];
-
-        const uint8_t h00 = b0->hi1[2*cc + 0], g00 = b0->signs[2*cc + 0];
-        const uint8_t h01 = b0->hi1[2*cc + 1], g01 = b0->signs[2*cc + 1];
-        const uint8_t h10 = b1->hi1[2*cc + 0], g10 = b1->signs[2*cc + 0];
-        const uint8_t h11 = b1->hi1[2*cc + 1], g11 = b1->signs[2*cc + 1];
-
-        const int sh = 4 * (tg & 1);
-
-        const half2 t00 = __floats2half2_rn(
-            (turbo3_centroid(((qq0 >>  sh      ) & 0x3) | (((h00 >> (2*tg    )) & 1) << 2)) + (((g00 >> (2*tg    )) & 1) ? qj0 : -qj0)) * n0,
-            (turbo3_centroid(((qq0 >> (sh + 2) ) & 0x3) | (((h00 >> (2*tg + 1)) & 1) << 2)) + (((g00 >> (2*tg + 1)) & 1) ? qj0 : -qj0)) * n0);
-        const half2 t01 = __floats2half2_rn(
-            (turbo3_centroid(((qq1 >>  sh      ) & 0x3) | (((h01 >> (2*tg    )) & 1) << 2)) + (((g01 >> (2*tg    )) & 1) ? qj0 : -qj0)) * n0,
-            (turbo3_centroid(((qq1 >> (sh + 2) ) & 0x3) | (((h01 >> (2*tg + 1)) & 1) << 2)) + (((g01 >> (2*tg + 1)) & 1) ? qj0 : -qj0)) * n0);
-        const half2 t10 = __floats2half2_rn(
-            (turbo3_centroid(((qq2 >>  sh      ) & 0x3) | (((h10 >> (2*tg    )) & 1) << 2)) + (((g10 >> (2*tg    )) & 1) ? qj1 : -qj1)) * n1,
-            (turbo3_centroid(((qq2 >> (sh + 2) ) & 0x3) | (((h10 >> (2*tg + 1)) & 1) << 2)) + (((g10 >> (2*tg + 1)) & 1) ? qj1 : -qj1)) * n1);
-        const half2 t11 = __floats2half2_rn(
-            (turbo3_centroid(((qq3 >>  sh      ) & 0x3) | (((h11 >> (2*tg    )) & 1) << 2)) + (((g11 >> (2*tg    )) & 1) ? qj1 : -qj1)) * n1,
-            (turbo3_centroid(((qq3 >> (sh + 2) ) & 0x3) | (((h11 >> (2*tg + 1)) & 1) << 2)) + (((g11 >> (2*tg + 1)) & 1) ? qj1 : -qj1)) * n1);
-
-        A[0] = *(const uint32_t *) &t00;
-        A[1] = *(const uint32_t *) &t10;
-        A[2] = *(const uint32_t *) &t01;
-        A[3] = *(const uint32_t *) &t11;
     }
 }
 
@@ -753,8 +714,8 @@ static __global__ void flash_attn_ext_vec(
                     // map as the nvfp4 branch above; the K side is ggml_cuda_fattn_turbo_kq_afrag
                     // (mux centroid decode + dither + norm folded into the f16 fragment words), so
                     // the only per-lane work here is the block pointer walk and one mma per fragment.
-                    static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0 ||
-                                  type_K == GGML_TYPE_TURBO4Q_0, "KQ_f16dq: unexpected fused type_K");
+                    static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0,
+                                  "KQ_f16dq: unexpected fused type_K");
 
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
@@ -1126,8 +1087,9 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     constexpr size_t nbytes_shared = 0;
     if constexpr (kq_f16_build) {
         // See the S2 speed gate comment at the turbo env helpers above: turbo4 K keeps the
-        // q8_1 dot + range-dither path (fused is measurably slower there); turbo5/turbo4q K
-        // follow the turbo switch.  nvfp4 keeps its own (default-ON) switch.
+        // q8_1 dot + range-dither path (fused is measurably slower there); turbo5 K follows
+        // the turbo switch (turbo4q K retired from this kernel - §12).  nvfp4 keeps its own
+        // (default-ON) switch.
         const bool kq_f16_sel = (type_K == GGML_TYPE_NVFP4)
             ? ggml_cuda_fattn_vec_kq_mma_f16_enabled()
             : (ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled() &&
@@ -1163,8 +1125,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     // Turbo K (S2): QK_TURBO* = 128 coords per block = 8 fragments, so the same D gate applies
     // (no D=64 turbo-K instances exist).  Runtime default: nvfp4 ON, turbo OFF (SS12 PPL gate).
     constexpr bool kq_f16_build  = (D == 128 || D == 256) &&
-        (type_K == GGML_TYPE_NVFP4 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0 ||
-         type_K == GGML_TYPE_TURBO4Q_0);
+        (type_K == GGML_TYPE_NVFP4 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0);
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
@@ -1244,18 +1205,11 @@ extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
 
 // Q_prod (MSE + 1-bit QJL residual sign) combos.
-extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_1, GGML_TYPE_TURBO4Q_0);
-extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_1, GGML_TYPE_TURBO4Q_0);
-extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_TURBO4Q_0);
-
+// turbo4q_0 combos were retired from the FA vec kernel on 2026-11-02 (worse PPL class than the
+// turbo4/turbo3 combos, branch buried - §12); such combos now fall back to the f16-scratch path.
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_1, GGML_TYPE_TURBO3Q_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_1, GGML_TYPE_TURBO3Q_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_TURBO3Q_0);
-
-extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4Q_0, GGML_TYPE_TURBO4_0);
-extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4Q_0, GGML_TYPE_TURBO4_0);
-extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4Q_0, GGML_TYPE_TURBO4Q_0);
-extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4Q_0, GGML_TYPE_TURBO4Q_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3Q_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3Q_0);
 

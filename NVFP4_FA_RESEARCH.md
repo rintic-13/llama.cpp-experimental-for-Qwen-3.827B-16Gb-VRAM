@@ -1044,22 +1044,40 @@ Gate plan (user runs, GPU idle per policy):
   stable across runs of the current exe; T2 has no snapshot and its bitwise gate was via DUMP comparison
   (identical=True in the dump_old/dump_new run), so this does not affect any gate. Unexplained, low prio.
 
-### §12 speed gate DECISION (2026-11-02): per-type selector - fused for turbo5/turbo4q K only
+### §12 speed gate DECISION (2026-11-02): per-type selector - fused for turbo5 K only (turbo4q retired)
 
 Idle-GPU timings reproduced across 3 runs (fa_turbo_ab_new med ms, D=256 | D=128):
 | K   | dot    | fused  | result |
 |-----|--------|--------|--------|
 | t4  | 1.413  | 1.921  | +36% slower (D128: 0.504 -> 0.863, +71%) -> fused REJECTED for turbo4 K |
 | t5  | 1.697  | 1.501  | -12% |
-| t4q | 1.487  | 1.293  | -13% (D128: 0.534 -> 0.469, -12%) |
+| t4q | 1.487  | 1.293  | -13% (D128: 0.534 -> 0.469, -12%) - rows since removed, see retirement note below |
 Break-even analysis: t4q fused (dither-free) = 1.29 is the floor for a hypothetical ZERO-dither t4 fused;
 the dither (~0.5ms at D256) cannot be made free (v2 generator is already 1 avalanche + 2 wide IMADs per
 4-coord word; per-lane half-hash or pair-lane shuffles save at most ~half), and the dp4a dot +
 turbo_dither_range path stays cheaper for t4. S2b-lite NOT implemented; decision implemented in
 fattn-vec.cuh instead: kq_f16_sel excludes TURBO4_0 unless env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1
 (experiment override; probe T6/C2 rows instantiate the template directly and still measure the t4 fused
-path). ppl_quick_turbo.cmd updated: T7-vs-T6 (t4q) is the real numerics gate, T5-vs-T2 must be exactly
-equal (selector-exclusion proof). PENDING: PPL run + routing R1-R6 (user, idle GPU).
+path). ppl_quick_turbo.cmd updated: T7-vs-T6 (t5) is the real numerics gate, T5-vs-T2 must be exactly
+equal (selector-exclusion proof). PENDING: PPL run + routing R1-R4 (user, idle GPU).
+
+### §12 turbo4q_0 retirement from the FA path (2026-11-02, user decision)
+
+turbo4q_0 (Q_prod: MSE + 1-bit QJL residual sign) has a worse PPL class than the turbo4/turbo3 combos -
+the branch was buried, no point keeping an FA kernel for it. Removed from ALL FA-path code: fattn-vec.cuh
+(afrag 4q decode branch + static_asserts, kq_f16_build type list, extern DECL turbo4q combos), fattn.cu
+(FATTN_VEC_CASE 4q combos, ggml_cuda_fattn_kv_type_supported), probes (ab rows T5/T9/C3/C4, frag probe
+4q unit row), routing script (R5/R6 - they never actually ran: the Oct-31 llama-bench/perplexity exes'
+embedded ggml type table cannot parse the name turbo4q_0, verified with the Z:\nonexistent.gguf parse
+probe; turbo5_0/turbo3_0 DO parse, PPL gate rows T6/T7 switched to the turbo5_0 pair). The QUANT CODEC
+itself (ggml-common.h block_turbo4q_0, turbo-quant.cuh, convert.cu, ggml type enum) stays for GGUF format
+compatibility - -ctk/-ctv turbo4q_0 on new builds just falls back to the f16-scratch FA path (correct, slow).
+Side benefit: ~10 fewer fattn template instantiations in ggml-cuda.dll.
+Build-system note: the fork compiles each FA combo from a tracked template-instances file, so the three
+fattn-vec-instance-(*turbo4q*) .cu files were git-rm'd too, and GGML_CUDA_FA_QUANTS in the build-dir
+CMakeCache.txt was updated (turbo4q combos removed) before reconfigure - cmake FATAL_ERRORs on a listed
+combo whose instance file is missing, and just editing the header would otherwise leave stale cached
+combos in ninja's list.
 
 ## Reproduce
 

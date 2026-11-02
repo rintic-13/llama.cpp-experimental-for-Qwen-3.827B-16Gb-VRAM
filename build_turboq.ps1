@@ -1,4 +1,6 @@
 ﻿# Reconfigure + rebuild llama.cpp TurboQuant fork with turbo3q/turbo4q FA kernels.
+# (2026-11-02: turbo4q_0 retired from the FA path - worse PPL class, branch buried,
+#  NVFP4_FA_RESEARCH.md SS12; its FA_QUANTS combos removed below, the codec stays.)
 # Switches (experiment A/B toggles):
 #   -QjlMse  : TURBO_QJL_MSE_OPTIMAL  (MSE-optimal QJL alpha; CLOSED experiment, never enable)
 #   -Dither  : GGML_TURBO_DITHER      (subtractive dither turbo3+turbo4; VALIDATED default -
@@ -14,7 +16,7 @@ $ErrorActionPreference = "Stop"
 Set-Location "G:\llama.cpp-experimental-for-Qwen-3.827B-16Gb-VRAM-main"
 
 $vcvars = 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'
-$fa = 'q4_0-q4_0;q8_0-q8_0;q8_0-q4_0;q5_1-q5_1;q5_1-q4_1;q5_1-q4_0;q4_1-q4_1;f16-f16;q5_1-turbo4_0;q5_1-turbo3_0;turbo4_0-turbo3_0;q5_1-turbo5_0;turbo5_0-turbo5_0;turbo5_0-turbo4_0;turbo5_0-turbo3_0;q5_1-turbo4q_0;q5_1-turbo3q_0;turbo4q_0-turbo4_0;turbo4q_0-turbo4q_0;turbo4_0-turbo3q_0;nvfp4-nvfp4;q5_1-nvfp4;f16-nvfp4'
+$fa = 'q4_0-q4_0;q8_0-q8_0;q8_0-q4_0;q5_1-q5_1;q5_1-q4_1;q5_1-q4_0;q4_1-q4_1;f16-f16;q5_1-turbo4_0;q5_1-turbo3_0;turbo4_0-turbo3_0;q5_1-turbo5_0;turbo5_0-turbo5_0;turbo5_0-turbo4_0;turbo5_0-turbo3_0;q5_1-turbo3q_0;turbo4_0-turbo3q_0;nvfp4-nvfp4;q5_1-nvfp4;f16-nvfp4'
 
 # Always pass ALL experiment options explicitly (ON or OFF) - otherwise the previous
 # configure's value lingers in CMakeCache.txt and silently leaks into builds.

@@ -1,4 +1,6 @@
 ﻿# =============================================================================
+# ARCHIVED 2026-11-02 (partial): turbo4q_0 retired from the FA path (SS12); its rows below
+# now fall back to f16-scratch on current builds - historical quality record only.
 # run_ppl_kv.ps1
 # Перплексия KV-кэша (llama-perplexity, форк с TurboQuant).
 #

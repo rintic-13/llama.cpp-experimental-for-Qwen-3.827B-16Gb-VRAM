@@ -539,16 +539,11 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASE(128, TURBO5_0, TURBO5_0)
     FATTN_VEC_CASE(256, TURBO5_0, TURBO5_0)
 
-    // Q_prod types (MSE + 1-bit QJL residual sign). K=turbo4q has a native vec_dot over the
-    // 3-bit centroids + QJL sign; turbo3q is V-only (like turbo3_0, no K vec_dot). No 64 cases
-    // for the turbo4q K combos: QK_TURBO4Q = 128 does not fit a 64-element row.
-    FATTN_VEC_CASES_ALL_D(Q5_1, TURBO4Q_0)
+    // Q_prod types (MSE + 1-bit QJL residual sign).  turbo3q is V-only (like turbo3_0, no K
+    // vec_dot).  The turbo4q_0 combos were retired from the FA vec kernel on 2026-11-02 (worse
+    // PPL class than the turbo4/turbo3 combos, branch buried - §12); -ctk/-ctv turbo4q_0 now
+    // falls back to the f16-scratch path (correct, slow).
     FATTN_VEC_CASES_ALL_D(Q5_1, TURBO3Q_0)
-
-    FATTN_VEC_CASE(128, TURBO4Q_0, TURBO4_0)
-    FATTN_VEC_CASE(256, TURBO4Q_0, TURBO4_0)
-    FATTN_VEC_CASE(128, TURBO4Q_0, TURBO4Q_0)
-    FATTN_VEC_CASE(256, TURBO4Q_0, TURBO4Q_0)
     FATTN_VEC_CASE(128, TURBO4_0, TURBO3Q_0)
     FATTN_VEC_CASE(256, TURBO4_0, TURBO3Q_0)
     FATTN_VEC_CASE(128, TURBO4_0, TURBO4_0)
@@ -606,7 +601,6 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO5_0:
         case GGML_TYPE_TURBO3Q_0:
-        case GGML_TYPE_TURBO4Q_0:
         case GGML_TYPE_NVFP4:
             return true;
         default:

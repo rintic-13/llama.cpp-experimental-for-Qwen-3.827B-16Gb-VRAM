@@ -1,5 +1,7 @@
 @echo off
 rem run_fa_turbo_ab.cmd - S1 turbo decode A/B: bitwise output match + timing (run when GPU is free)
+rem ARCHIVED 2026-11-02: T5_turbo4q row retired with turbo4q from the FA path (SS12); the current
+rem fa_turbo_ab_new.exe has no T5 snapshot - the T5 hash line below only matches the old S1 dumps.
 setlocal
 set ROOT=G:\llama.cpp-experimental-for-Qwen-3.827B-16Gb-VRAM-main
 set TMPD=C:\Users\rinat\AppData\Local\Temp\opencode

@@ -28,12 +28,6 @@ static __device__ float ref_val_turbo5(const block_turbo5_0 * row, int b, int j,
     const float norm = __half2float(row[b].norm);
     return turbo5_dequant_element(&row[b], j, norm);
 }
-static __device__ float ref_val_turbo4q(const block_turbo4q_0 * row, int b, int j, uint32_t seed) {
-    GGML_UNUSED(seed);
-    const float norm      = __half2float(row[b].norm);
-    const float qjl_scale = TURBO_QJL_ALPHA * __half2float(row[b].rnorm);
-    return turbo4q_dequant_element(&row[b], j, norm, qjl_scale);
-}
 
 static __device__ __forceinline__ uint16_t hbits_of(float v) {   // same memcpy pattern as fattn-vec.cuh
     const __half h = __float2half_rn(v);
@@ -50,12 +44,6 @@ static __device__ int loc_turbo4(const block_turbo4_0 * row, int b, uint16_t hbi
 static __device__ int loc_turbo5(const block_turbo5_0 * row, int b, uint16_t hbits) {
     for (int j = 0; j < QK_TURBO5; ++j) {
         if (hbits_of(ref_val_turbo5(row, b, j, 0)) == hbits) return j;
-    }
-    return -1;
-}
-static __device__ int loc_turbo4q(const block_turbo4q_0 * row, int b, uint16_t hbits) {
-    for (int j = 0; j < QK_TURBO4Q; ++j) {
-        if (hbits_of(ref_val_turbo4q(row, b, j, 0)) == hbits) return j;
     }
     return -1;
 }
@@ -96,13 +84,11 @@ __global__ void frag_k(TB * row0, TB * row1, uint32_t seedbase, const int64_t bl
                     float rv;
                     if constexpr (TK == GGML_TYPE_TURBO4_0)  rv = ref_val_turbo4 (rb, b, j, seed);
                     if constexpr (TK == GGML_TYPE_TURBO5_0)  rv = ref_val_turbo5 (rb, b, j, seed);
-                    if constexpr (TK == GGML_TYPE_TURBO4Q_0) rv = ref_val_turbo4q(rb, b, j, seed);
                     const uint16_t exp = hbits_of(rv);
                     if (got != exp) {
                         int gj;
                         if constexpr (TK == GGML_TYPE_TURBO4_0)  gj = loc_turbo4 (rb, b, got, seed);
                         if constexpr (TK == GGML_TYPE_TURBO5_0)  gj = loc_turbo5 (rb, b, got);
-                        if constexpr (TK == GGML_TYPE_TURBO4Q_0) gj = loc_turbo4q(rb, b, got);
                         printf("MISMATCH TK=%d f=%d tg=%d slot=%d half=%d row=%d: expected j=%d (%04x), got value of coord j'=%d (%04x)\n",
                                (int) TK, f, tg, slot, h, row, j, exp, gj, got);
                         ++*bad;
@@ -119,34 +105,28 @@ int main() {
     // synthetic benign blocks (norms moderate, random index bytes)
     block_turbo4_0  h4[2], hd4[2];
     block_turbo5_0  h5[2], hd5[2];
-    block_turbo4q_0 hq[2], hdq[2];
     unsigned s = 7;
     auto rnd = [&](uint8_t * p, size_t n) { for (size_t i = 0; i < n; ++i) { s = s*1664525u + 1013904223u; p[i] = (uint8_t)(s >> 16); } };
     rnd(((uint8_t*)h4)+2,  sizeof(h4)-2);  rnd(((uint8_t*)hd4)+2,  sizeof(hd4)-2);
     rnd(((uint8_t*)h5)+2,  sizeof(h5)-2);  rnd(((uint8_t*)hd5)+2,  sizeof(hd5)-2);
-    rnd(((uint8_t*)hq)+4,  sizeof(hq)-4);  rnd(((uint8_t*)hdq)+4,  sizeof(hdq)-4);
     fill_norms(h4, 2, 0.7f, 0);  fill_norms(hd4, 2, 0.3f, 0);
     fill_norms(h5, 2, 0.9f, 0);  fill_norms(hd5, 2, 0.4f, 0);
-    fill_norms(hq, 2, 1.1f, 0.6f); fill_norms(hdq, 2, 0.2f, 0.9f);
 
-    block_turbo4_0  *d4,  *dd4;  block_turbo5_0  *d5,  *dd5;  block_turbo4q_0 *dq, *ddq;
+    block_turbo4_0  *d4,  *dd4;  block_turbo5_0  *d5,  *dd5;
     CK(cudaMalloc(&d4,  sizeof(h4)));  CK(cudaMemcpy(d4,  h4,  sizeof(h4),  cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dd4, sizeof(hd4))); CK(cudaMemcpy(dd4, hd4, sizeof(hd4), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d5,  sizeof(h5)));  CK(cudaMemcpy(d5,  h5,  sizeof(h5),  cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dd5, sizeof(hd5))); CK(cudaMemcpy(dd5, hd5, sizeof(hd5), cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&dq,  sizeof(hq)));  CK(cudaMemcpy(dq,  hq,  sizeof(hq),  cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&ddq, sizeof(hdq))); CK(cudaMemcpy(ddq, hdq, sizeof(hdq), cudaMemcpyHostToDevice));
 
-    int * bad; CK(cudaMalloc(&bad, 4*sizeof(int))); CK(cudaMemset(bad, 0, 4*sizeof(int)));
+    int * bad; CK(cudaMalloc(&bad, 3*sizeof(int))); CK(cudaMemset(bad, 0, 3*sizeof(int)));
     // row1 = second block set of the SAME allocation (two independent blocks per row array)
     frag_k<GGML_TYPE_TURBO4_0, block_turbo4_0> <<<1,1>>>(d4,  d4+1, 12345u, blk_per_row, bad);
     frag_k<GGML_TYPE_TURBO4_0, block_turbo4_0> <<<1,1>>>(dd4, dd4+1, 999u,  blk_per_row, bad+1);
     frag_k<GGML_TYPE_TURBO5_0, block_turbo5_0> <<<1,1>>>(d5,  d5+1, 222u,  blk_per_row, bad+2);
-    frag_k<GGML_TYPE_TURBO4Q_0, block_turbo4q_0><<<1,1>>>(dq, dq+1, 333u,  blk_per_row, bad+3);
     CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
 
-    int hb[4]; CK(cudaMemcpy(hb, bad, sizeof(hb), cudaMemcpyDeviceToHost));
-    printf("frag mismatch counts: turbo4(a)=%d turbo4(b-norms)=%d turbo5=%d turbo4q=%d (0=OK, expect 0/192 slots each)\n",
-           hb[0], hb[1], hb[2], hb[3]);
-    return (hb[0] || hb[1] || hb[2] || hb[3]) ? 1 : 0;
+    int hb[3]; CK(cudaMemcpy(hb, bad, sizeof(hb), cudaMemcpyDeviceToHost));
+    printf("frag mismatch counts: turbo4(a)=%d turbo4(b-norms)=%d turbo5=%d (0=OK, expect 0/192 slots each)\n",
+           hb[0], hb[1], hb[2]);
+    return (hb[0] || hb[1] || hb[2]) ? 1 : 0;
 }

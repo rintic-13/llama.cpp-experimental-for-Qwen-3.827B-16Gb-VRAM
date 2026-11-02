@@ -486,52 +486,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5_0(
     return sum;
 }
 
-// ---- TurboQuant KQ dot for the 4-bit Q_prod type (K in turbo4q_0: 3-bit PolarQuant + QJL) ----
-// Reconstruction per element: norm * (centroid3[idx] + sign * TURBO_QJL_ALPHA * rnorm).
-// FIX 2026-10-31: same k_KQ/q8[0] indexing bug as turbo5_0 above, fixed the same way
-// (4 coords per q8_1 word, per vec_dot_fattn_vec_KQ_turbo4_0).
-template <int D, int nthreads>
-static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4q_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
-    const int64_t /* k_ibase */) {
-    GGML_UNUSED(Q_v);
-
-    const block_turbo4q_0 * K_turbo4q = (const block_turbo4q_0 *) K_c;
-
-    float sum = 0.0f;
-
-#pragma unroll
-    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
-        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
-
-        const int ib   = k_KQ / (QK_TURBO4Q/4);
-        const int iqs4 = k_KQ % (QK_TURBO4Q/4);
-
-        const float norm       = __half2float(K_turbo4q[ib].norm);
-        const float qjl_scale  = TURBO_QJL_ALPHA * __half2float(K_turbo4q[ib].rnorm);
-
-        float c[4], sumc = 0.0f;
-#pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const int iq = 4*iqs4 + l;
-            const uint8_t lo  = (K_turbo4q[ib].qs   [iq / 4] >> ((iq % 4) * 2)) & 0x3;
-            const uint8_t hi  = (K_turbo4q[ib].hi1  [iq / 8] >>  (iq % 8))      & 0x1;
-            const uint8_t sgn = (K_turbo4q[ib].signs[iq / 8] >>  (iq % 8))      & 0x1;
-            c[l] = norm * (turbo3_centroid(lo | (hi << 2)) + (sgn ? qjl_scale : -qjl_scale));
-            sumc += c[l];
-        }
-
-        const int    u    = Q_q8[k_KQ_0/nthreads];
-        const int8_t * q8 = (const int8_t *) &u;
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
-
-        const float doti = q8[0]*c[0] + q8[1]*c[1] + q8[2]*c[2] + q8[3]*c[3];
-
-        sum += Q_ds.x*doti + (Q_ds.y/QK8_1)*sumc;
-    }
-
-    return sum;
-}
+// turbo4q_0 KQ dot was removed 2026-11-02 together with the turbo4q FA combos (branch buried,
+// see NVFP4_FA_RESEARCH.md §12); the codec itself (turbo4q_dequant_element) stays in turbo-quant.cuh.
 
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
@@ -980,35 +936,8 @@ static __device__ __forceinline__ void dequantize_V_turbo3q_0(const void * __res
     }
 }
 
-template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_turbo4q_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
-    const block_turbo4q_0 * x = (const block_turbo4q_0 *) vx;
-
-    const int64_t ib = i0 / QK_TURBO4Q;
-    const int     j0 = i0 % QK_TURBO4Q;
-
-    static_assert(ne == 2 || ne == 4, "bad ne");
-    const float norm = __half2float(x[ib].norm);
-    const float qjl_scale = TURBO_QJL_ALPHA * __half2float(x[ib].rnorm);
-
-#ifdef FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, half>) {
-#pragma unroll
-        for (int l0 = 0; l0 < ne; l0 += 2) {
-            ((half2 *) dst)[l0/2] = make_half2(turbo4q_dequant_element(x + ib, j0 + l0 + 0, norm, qjl_scale),
-                                                turbo4q_dequant_element(x + ib, j0 + l0 + 1, norm, qjl_scale));
-        }
-    } else
-#endif // FP16_AVAILABLE
-    if constexpr (std::is_same_v<T, float>) {
-#pragma unroll
-        for (int l = 0; l < ne; ++l) {
-            ((float *) dst)[l] = turbo4q_dequant_element(x + ib, j0 + l, norm, qjl_scale);
-        }
-    } else {
-        static_assert(std::is_same_v<T, void>, "bad type");
-    }
-}
+// dequantize_V_turbo4q_0 was removed 2026-11-02 together with the turbo4q FA combos (§12); V=4q
+// combos are no longer instantiated, the codec remains in turbo-quant.cuh for the GGUF format.
 
 // ---- NVFP4-like KV cache (Stage A, single-level: per-16 UE4M3 scale + packed E2M1 nibbles) ----
 // No dither, no rotation - the encoder writes plain (unrotated) rows, max/6 scale policy.
@@ -1220,8 +1149,6 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO5_0) {
         return vec_dot_fattn_vec_KQ_turbo5_0<D, nthreads>;
-    } else if constexpr (type_K == GGML_TYPE_TURBO4Q_0) {
-        return vec_dot_fattn_vec_KQ_turbo4q_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_NVFP4) {
         return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
@@ -1254,8 +1181,6 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO3Q_0) {
         return dequantize_V_turbo3q_0<T, ne>;
-    } else if constexpr (type_V == GGML_TYPE_TURBO4Q_0) {
-        return dequantize_V_turbo4q_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_NVFP4) {
         return dequantize_V_nvfp4<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {

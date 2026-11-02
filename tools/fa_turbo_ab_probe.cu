@@ -11,8 +11,8 @@
 //   T2 q5_1    K + turbo3_0 V, dot
 //   T3 turbo4_0 K + turbo4_0 V, dot
 //   T4 turbo5_0 K + turbo3_0 V, dot
-//   T5 turbo4q_0 K + turbo4_0 V, dot
-//   T6..T9 same K/V pairs with the S2 fused f16-MMA KQ path (KQ_f16dq=true) - timing only, the
+//   (T5/C3/C4 turbo4q_0 rows retired 2026-11-02: turbo4q buried, NVFP4_FA_RESEARCH.md SS12)
+//   T6..T8 same K/V pairs with the S2 fused f16-MMA KQ path (KQ_f16dq=true) - timing only, the
 //   numerics intentionally change (f16 K/Q rounding like nvfp4 fused), so their dumps are NOT
 //   bitwise-compared across exes; the PPL gate validates them instead.
 //   C* rows: D=128 (production head size) dot vs fused pairs + host max-diff reports.
@@ -42,11 +42,9 @@ static const int NKV   = 32768;   // cache length (d32768)
 static const int NB_TURBO4_256  = 2*(int) sizeof(block_turbo4_0);   // 132
 static const int NB_TURBO3_256  = 2*(int) sizeof(block_turbo3_0);   // 100
 static const int NB_TURBO5_256  = 2*(int) sizeof(block_turbo5_0);   // 164
-static const int NB_TURBO4Q_256 = 2*(int) sizeof(block_turbo4q_0);  // 136
 static const int NB_Q51_256     = (D256/QK5_1)*(int) sizeof(block_q5_1);
 static const int NB_TURBO4_128  = (int) sizeof(block_turbo4_0);
 static const int NB_TURBO3_128  = (int) sizeof(block_turbo3_0);
-static const int NB_TURBO4Q_128 = (int) sizeof(block_turbo4q_0);
 
 // benign cache: random index bytes, half-norms patched to 0.25 (and rnorm for Q_prod) so all
 // decoded values are finite and moderate. norm (and rnorm) are the first fields of every block.
@@ -237,13 +235,12 @@ int main(int argc, char ** argv) {
     const auto t4  = make_turbo_cache(NB_TURBO4_256,  sizeof(block_turbo4_0),  1, 11);
     const auto t3  = make_turbo_cache(NB_TURBO3_256,  sizeof(block_turbo3_0),  1, 13);
     const auto t5  = make_turbo_cache(NB_TURBO5_256,  sizeof(block_turbo5_0),  1, 17);
-    const auto t4q = make_turbo_cache(NB_TURBO4Q_256, sizeof(block_turbo4q_0), 2, 19);
     const auto q51 = make_q51_cache();
 
-    char *Kt4, *Kt5, *Kt4q, *Kq51, *Vt3, *Vt4;
+    char *Kt4, *Kt5, *Kq51, *Vt3, *Vt4;
     CK(cudaMalloc(&Kt4,  t4.size()));  CK(cudaMemcpy(Kt4,  t4.data(),  t4.size(),  cudaMemcpyHostToDevice));
     CK(cudaMalloc(&Kt5,  t5.size()));  CK(cudaMemcpy(Kt5,  t5.data(),  t5.size(),  cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&Kt4q, t4q.size())); CK(cudaMemcpy(Kt4q, t4q.data(), t4q.size(), cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&Kq51, q51.size())); CK(cudaMemcpy(Kq51, q51.data(), q51.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&Kq51, q51.size())); CK(cudaMemcpy(Kq51, q51.data(), q51.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&Vt3,  t3.size()));  CK(cudaMemcpy(Vt3,  t3.data(),  t3.size(),  cudaMemcpyHostToDevice));
     CK(cudaMalloc(&Vt4,  t4.size()));  CK(cudaMemcpy(Vt4,  t4.data(),  t4.size(),  cudaMemcpyHostToDevice));
@@ -251,10 +248,8 @@ int main(int argc, char ** argv) {
     // D=128 caches (1 block per row, same seeds so values match the D=256 cache first halves)
     const auto t4s  = make_turbo_cache(NB_TURBO4_128,  sizeof(block_turbo4_0),  1, 11);
     const auto t3s  = make_turbo_cache(NB_TURBO3_128,  sizeof(block_turbo3_0),  1, 13);
-    const auto t4qs = make_turbo_cache(NB_TURBO4Q_128, sizeof(block_turbo4q_0), 2, 19);
-    char *Kt4s, *Kt4qs, *Vt3s, *Vt4s;
+    char *Kt4s, *Vt3s, *Vt4s;
     CK(cudaMalloc(&Kt4s,  t4s.size()));  CK(cudaMemcpy(Kt4s,  t4s.data(),  t4s.size(),  cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&Kt4qs, t4qs.size())); CK(cudaMemcpy(Kt4qs, t4qs.data(), t4qs.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&Vt3s,  t3s.size()));  CK(cudaMemcpy(Vt3s,  t3s.data(),  t3s.size(),  cudaMemcpyHostToDevice));
     CK(cudaMalloc(&Vt4s,  t4s.size()));  CK(cudaMemcpy(Vt4s,  t4s.data(),  t4s.size(),  cudaMemcpyHostToDevice));
 
@@ -267,32 +262,26 @@ int main(int argc, char ** argv) {
 
     const int nsm = dp.multiProcessorCount;
     const int reps = 11;
-    std::vector<float> snapT1, snapT3, snapT4, snapT5, snapT6, snapT7, snapT8, snapT9, snapC1, snapC2, snapC3, snapC4;
+    std::vector<float> snapT1, snapT3, snapT4, snapT6, snapT7, snapT8, snapC1, snapC2;
 
-    // ---- D=256 decode-shape rows (bitwise gate rows T1..T5 must keep byte-identical dumps) ----
+    // ---- D=256 decode-shape rows (bitwise gate rows T1..T4 must keep byte-identical dumps) ----
     variant<D256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0,  false>("T1_turbo4-t3",    Kt4,  Vt3, NB_TURBO4_256,  NB_TURBO3_256,  Q, dst, meta, nsm, reps, &snapT1);
     variant<D256, GGML_TYPE_Q5_1,     GGML_TYPE_TURBO3_0,  false>("T2_q5_1-t3",      Kq51, Vt3, NB_Q51_256,     NB_TURBO3_256,  Q, dst, meta, nsm, reps);
     variant<D256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0,  false>("T3_turbo4-t4",    Kt4,  Vt4, NB_TURBO4_256,  NB_TURBO4_256,  Q, dst, meta, nsm, reps, &snapT3);
     variant<D256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0,  false>("T4_turbo5-t3",    Kt5,  Vt3, NB_TURBO5_256,  NB_TURBO3_256,  Q, dst, meta, nsm, reps, &snapT4);
-    variant<D256, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  false>("T5_turbo4q-t4",   Kt4q, Vt4, NB_TURBO4Q_256, NB_TURBO4_256,  Q, dst, meta, nsm, reps, &snapT5);
     variant<D256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0,  true >("T6_fused-t4t3",   Kt4,  Vt3, NB_TURBO4_256,  NB_TURBO3_256,  Q, dst, meta, nsm, reps, &snapT6);
     variant<D256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0,  true >("T7_fused-t4t4",   Kt4,  Vt4, NB_TURBO4_256,  NB_TURBO4_256,  Q, dst, meta, nsm, reps, &snapT7);
     variant<D256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0,  true >("T8_fused-t5t3",   Kt5,  Vt3, NB_TURBO5_256,  NB_TURBO3_256,  Q, dst, meta, nsm, reps, &snapT8);
-    variant<D256, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  true >("T9_fused-t4qt4",  Kt4q, Vt4, NB_TURBO4Q_256, NB_TURBO4_256,  Q, dst, meta, nsm, reps, &snapT9);
 
     // ---- D=128 rows (production head size): dot vs fused numerical A/B ----
     variant<D128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0,  false>("C1_d128-t4t3",    Kt4s,  Vt3s, NB_TURBO4_128,  NB_TURBO3_128,  Q, dst, meta, nsm, reps, &snapC1);
     variant<D128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0,  true >("C2_d128fused",    Kt4s,  Vt3s, NB_TURBO4_128,  NB_TURBO3_128,  Q, dst, meta, nsm, reps, &snapC2);
-    variant<D128, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  false>("C3_d128-t4qt4",   Kt4qs, Vt4s, NB_TURBO4Q_128, NB_TURBO4_128,  Q, dst, meta, nsm, reps, &snapC3);
-    variant<D128, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  true >("C4_d128fused4q",  Kt4qs, Vt4s, NB_TURBO4Q_128, NB_TURBO4_128,  Q, dst, meta, nsm, reps, &snapC4);
 
     printf("\nS2 numerics sanity (fused != dot BY DESIGN; merged partials, max rel should be ~1e-3, NOT ~1e+0):\n");
     cmp_path("t4-t3  D256", snapT1, snapT6);
     cmp_path("t4-t4  D256", snapT3, snapT7);   // correct pair: K=t4, V=t4
     cmp_path("t5-t3  D256", snapT4, snapT8);   // correct pair: K=t5, V=t3
-    cmp_path("t4q-t4 D256", snapT5, snapT9);   // correct pair: K=t4q, V=t4
     cmp_path("t4-t3  D128", snapC1, snapC2);
-    cmp_path("t4q-t4 D128", snapC3, snapC4);
 
     return 0;
 }

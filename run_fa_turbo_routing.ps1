@@ -35,7 +35,7 @@ Run-Row "R1 turbo4-turbo3  GATE-ON (current default)" @("-ctk","turbo4_0","-ctv"
 Run-Row "R2 turbo4-turbo3  NATIVE vec (S1 kernel)"     @("-ctk","turbo4_0","-ctv","turbo3_0") "NATIVE"
 Run-Row "R3 q5_1-turbo3    NATIVE (default, S1)"       @("-ctk","q5_1","-ctv","turbo3_0") ""
 Run-Row "R4 q5_1-turbo3    FALLBACK f16-scratch"       @("-ctk","q5_1","-ctv","turbo3_0") "FALLBACK"
-Run-Row "R5 turbo4q-turbo4 GATE-ON (default)"          @("-ctk","turbo4q_0","-ctv","turbo4_0") ""
-Run-Row "R6 turbo4q-turbo4 NATIVE vec"                 @("-ctk","turbo4q_0","-ctv","turbo4_0") "NATIVE"
-Write-Host "Compare pp512/pp4096/tg128 columns across pairs (R1vsR2, R3vsR4, R5vsR6)."
+# R5/R6 (turbo4q_0) removed 2026-11-02: type retired from the FA path (worse PPL class, branch buried -
+# SS12).  They also never ran with these Oct-31 bench exes, whose type table cannot parse the name.
+Write-Host "Compare pp512/pp4096/tg128 columns across pairs (R1vsR2, R3vsR4)."
 Write-Host "Expectation post-S1: tg128 R2 ~2x R1 (probe: vec 2.89->1.42ms); pp roughly tie (both do one convert per prefill call, not per token)."
