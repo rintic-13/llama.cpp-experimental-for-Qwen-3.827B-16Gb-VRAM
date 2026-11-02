@@ -1158,6 +1158,18 @@ vars set. Note this also corrects the naive expectation "turbo4 production == T2
 turbo4 routing keeps the f16-scratch numerics class (T1) even at -b1 -ub1, so the right equality anchor
 for turbo4 is T1, not T2 (T2 needs GGML_CUDA_FATTN_VEC_NATIVE=1).
 
+Production A/B on the flipped DLL (llama-bench -ngl 99 -fa on -t 7 -ub 512 -d 8192 -p 512 -n 128 -r 3,
+turbo5-turbo3, nothing else set):
+
+| mode | pp512 @ d8192 | tg128 @ d8192 |
+|------|---------------|---------------|
+| fused KQ ON (default) | 890.32 t/s | 27.28 t/s |
+| forced dot KQ (env =0) | 890.44 t/s | 26.79 t/s |
+
++1.8% end-to-end decode, prefill untouched (the probe's -12% is the KQ block only; at d8192 the rest of
+the graph dominates, so the realized win is 1.8%). Small but free and numerically gated - and it was
+already being collected in production because decode always runs the vec kernel (see R1-R4).
+
 ## Reproduce
 
 ```
