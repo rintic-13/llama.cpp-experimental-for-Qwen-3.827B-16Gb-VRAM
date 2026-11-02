@@ -1067,17 +1067,96 @@ turbo4q_0 (Q_prod: MSE + 1-bit QJL residual sign) has a worse PPL class than the
 the branch was buried, no point keeping an FA kernel for it. Removed from ALL FA-path code: fattn-vec.cuh
 (afrag 4q decode branch + static_asserts, kq_f16_build type list, extern DECL turbo4q combos), fattn.cu
 (FATTN_VEC_CASE 4q combos, ggml_cuda_fattn_kv_type_supported), probes (ab rows T5/T9/C3/C4, frag probe
-4q unit row), routing script (R5/R6 - they never actually ran: the Oct-31 llama-bench/perplexity exes'
-embedded ggml type table cannot parse the name turbo4q_0, verified with the Z:\nonexistent.gguf parse
-probe; turbo5_0/turbo3_0 DO parse, PPL gate rows T6/T7 switched to the turbo5_0 pair). The QUANT CODEC
+4q unit row), routing script (R5/R6). The QUANT CODEC
 itself (ggml-common.h block_turbo4q_0, turbo-quant.cuh, convert.cu, ggml type enum) stays for GGUF format
-compatibility - -ctk/-ctv turbo4q_0 on new builds just falls back to the f16-scratch FA path (correct, slow).
+compatibility - -ctk/-ctv turbo4q on new builds just falls back to the f16-scratch FA path (correct, slow).
 Side benefit: ~10 fewer fattn template instantiations in ggml-cuda.dll.
 Build-system note: the fork compiles each FA combo from a tracked template-instances file, so the three
 fattn-vec-instance-(*turbo4q*) .cu files were git-rm'd too, and GGML_CUDA_FA_QUANTS in the build-dir
 CMakeCache.txt was updated (turbo4q combos removed) before reconfigure - cmake FATAL_ERRORs on a listed
 combo whose instance file is missing, and just editing the header would otherwise leave stale cached
 combos in ninja's list.
+
+### §12 naming trap (2026-11-03): CLI type names have NO `_0` suffix
+
+Two different spellings coexist and MUST NOT be mixed up:
+- cmake `GGML_CUDA_FA_QUANTS` combo strings use the enum form: `turbo4_0-turbo3_0`, `turbo5_0-turbo3_0`
+  (reconfigure.cmd / configure.cmd / build_turboq.ps1).
+- the CLI `-ctk/-ctv` values come from the ggml type_name table: `turbo3`, `turbo4`, `turbo5`,
+  `turbo3q`, `turbo4q` (ggml.c:855-879; mapping in llama-bench.cpp:525-542). `-ctk turbo4_0` is
+  REJECTED: "Unsupported cache type" and the row never runs.
+First real S2 PPL run (2026-11-03) failed exactly this way - T1/T2/T3/T5/T6/T7 all bailed at arg
+parsing and only the f16 row (T4) produced PPL. An earlier note in this section claiming the Oct-31 exes
+"cannot parse turbo4q_0 but DO parse turbo5_0/turbo3_0" was wrong (it conflated the cmake combo names with
+CLI names). ppl_quick_turbo.cmd and run_fa_turbo_routing.ps1 fixed to the suffix-less spellings; the older
+scripts (run_kv_dump.ps1, run_check_dither_turbo3.ps1, run_check_nvfp4_stageA.ps1) always used them, which
+is why they worked.
+
+### §12 PPL gate round 2 (2026-11-03): PASS
+
+Idle GPU, `ppl_quick_turbo.cmd` (-c 4096 --chunks 1 -b 1 -ub 1 -ngl 99 -fa on -s 42), all 7 rows parsed
+after the naming fix (the same binary/DLL as the probes: Oct-31 llama.dll + ggml-cuda.dll @ 00:13, i.e.
+turbo4q removed, selector per type):
+
+| row | K-V | routing | PPL | note |
+|-----|-----|---------|-----|------|
+| T1 | turbo4-turbo3 | default (f16-scratch) | 7.1719 | |
+| T2 | turbo4-turbo3 | NATIVE dot (S1 vec) | 7.1802 | |
+| T3 | q5_1-turbo3 | NATIVE dot (S1 vec) | 7.1743 | |
+| T4 | f16-f16 | gold | 7.1378 | == documented gold ref exactly |
+| T5 | turbo4-turbo3 | NATIVE + FUSED KQ | 7.1802 | EXACTLY == T2 (+-0.37961 both) |
+| T6 | turbo5-turbo3 | NATIVE dot (S1 vec) | 7.1920 | |
+| T7 | turbo5-turbo3 | NATIVE + FUSED KQ | 7.1868 | |
+
+- Gate 1 (selector-exclusion proof): T5 == T2 to the last printed digit -> the fused KQ path is NOT taken
+  for TURBO4_0 K; the per-type selector works in the real binary.
+- Gate 2 (numerics): dPPL(T7-T6) = -0.0052, |dPPL| <= 0.05 -> PASS (nvfp4 fused precedent was +0.0318,
+  i.e. 6x larger). The fused f16-MMA KQ for turbo5 K is numerically equivalent at gate resolution
+  (stderr +-0.38 makes 0.005 invisible).
+- Sanity: T4 gold 7.1378 reproduces the old ref bit-for-bit, so the whole protocol (chunks/sampler/seed) is
+  unchanged; T1 (default f16-scratch numerics) vs T2 (native vec) differ by only 0.0083, consistent with
+  the S1 numerics-noise class.
+
+### §12 routing gate R1-R4 (2026-11-03): defaults already optimal, no flip
+
+llama-bench (-ngl 99 -fa on -t 7 -ub 512, -pg 512,128 -pg 4096,128 -r 2, GGML_FATTN_DEBUG=1). NOTE:
+`-pg` takes ONE `pp,tg` pair; several pairs must be repeated flags - the `-pg "512,128;4096,128"`
+form dies with "invalid parameter for argument: -pg" (string_split on ',' yields 3 fields).
+
+| row | K-V | routing | pp512 t/s | pp4096+tg t/s | tg128 t/s | pp512+tg t/s |
+|-----|-----|---------|-----------|---------------|-----------|--------------|
+| R1 | turbo4-turbo3 | default (gate ON) | 954.02 | 500.95 | 32.82 | 143.81 |
+| R2 | turbo4-turbo3 | NATIVE vec | 955.37 | 493.74 | 32.38 | 142.71 |
+| R3 | q5_1-turbo3 | default (vec) | 953.72 | 508.43 | 32.92 | 144.39 |
+| R4 | q5_1-turbo3 | FALLBACK f16-scratch | 951.48 | 502.82 | 33.09 | 144.48 |
+
+- KEY FINDING vs the old expectation in the script header: at decode (nq=1) the log prints
+  `kernel=vec` for ALL four rows - the routing gate only changes the PREFILL path (nq=512 prints
+  `kernel=mma_f16` in R1/R3/R4 and `vec` only in R2). So the env switches cannot move tg128, and the
+  old "tg128 R2 ~2x R1" expectation is dead: S1 mux decode is already the production decode path for
+  every one of these combos. Consequence for S2: the fused KQ -12% (turbo5 K) lands directly in
+  PRODUCTION decode, no routing change needed to collect it.
+- R1 >= R2 at pp4096+tg (500.95 vs 493.74, +1.5%) -> keep the turbo4 prefill gate ON (f16-scratch),
+  it is still the faster prefill for the dither-heavy type.
+- R3 > R4 at pp4096+tg (508.43 vs 502.82, +1.1%) -> keep the native vec prefill for q5_1/turbo3.
+- pg512 columns are all within +-0.4% (noise). Verdict: routing defaults unchanged; only the S2 compile
+  default flips (below).
+
+### §12 S2 CLOSED (2026-11-03): GGML_CUDA_FATTN_TURBO_KQ_MMA_F16 default flips to ON
+
+Both gates passed, so the cmake option default went OFF -> ON (ggml/CMakeLists.txt:210 + the build-dir
+CMakeCache entry, which otherwise keeps overriding the new default) and the comments in
+ggml/src/ggml-cuda/CMakeLists.txt + fattn-vec.cuh were updated. The runtime selector still confines the
+fused path to TURBO5_0 K; TURBO4_0 K keeps q8_1 dot + range dither (env
+GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1 to experiment), turbo4q is gone.
+Production expectation at -b1 -ub1 (no prefill batching, so the turbo4 prefill gate is irrelevant):
+turbo4-t3 == 7.1719 (= T1, the pre-flip production row - i.e. turbo4 is bit-identical before/after the
+flip, selector exclusion holds) and turbo5-t3 == 7.1868 (= T7, fused really is the default now).
+VERIFIED 2026-11-03 on the rebuilt DLL (65 078 272 B @ 00:46, 161 ninja rules carry
+-DGGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT=1): P1 turbo4-t3 = 7.1719, P2 turbo5-t3 = 7.1868, no env
+vars set. Note this also corrects the naive expectation "turbo4 production == T2": the production
+turbo4 routing keeps the f16-scratch numerics class (T1) even at -b1 -ub1, so the right equality anchor
+for turbo4 is T1, not T2 (T2 needs GGML_CUDA_FATTN_VEC_NATIVE=1).
 
 ## Reproduce
 

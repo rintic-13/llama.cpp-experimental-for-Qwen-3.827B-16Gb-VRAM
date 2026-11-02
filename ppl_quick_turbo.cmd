@@ -19,15 +19,15 @@ echo == nvidia-smi before ==
 nvidia-smi --query-gpu=memory.used,memory.free,utilization.gpu --format=csv,noheader
 
 echo == T1 turbo4-turbo3 DEFAULT routing (f16-scratch numerics) ==
-%B% -m %M% -f %F% %COMMON% -ctk turbo4_0 -ctv turbo3_0
+%B% -m %M% -f %F% %COMMON% -ctk turbo4 -ctv turbo3
 
 echo == T2 turbo4-turbo3 NATIVE vec (q8_1 dot + S1 mux) ==
 set GGML_CUDA_FATTN_VEC_NATIVE=1
-%B% -m %M% -f %F% %COMMON% -ctk turbo4_0 -ctv turbo3_0
+%B% -m %M% -f %F% %COMMON% -ctk turbo4 -ctv turbo3
 set GGML_CUDA_FATTN_VEC_NATIVE=
 
 echo == T3 q5_1-turbo3 NATIVE default (q8_1 dot + S1 mux) ==
-%B% -m %M% -f %F% %COMMON% -ctk q5_1 -ctv turbo3_0
+%B% -m %M% -f %F% %COMMON% -ctk q5_1 -ctv turbo3
 
 echo == T4 f16 gold reference ==
 %B% -m %M% -f %F% %COMMON% -ctk f16 -ctv f16
@@ -35,19 +35,19 @@ echo == T4 f16 gold reference ==
 echo == T5 turbo4-turbo3 NATIVE vec + FUSED f16-MMA KQ (S2 gate row) ==
 set GGML_CUDA_FATTN_VEC_NATIVE=1
 set GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=1
-%B% -m %M% -f %F% %COMMON% -ctk turbo4_0 -ctv turbo3_0
+%B% -m %M% -f %F% %COMMON% -ctk turbo4 -ctv turbo3
 set GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=
 set GGML_CUDA_FATTN_VEC_NATIVE=
 
 echo == T6 turbo5-turbo3 NATIVE vec (q8_1 dot + S1 mux) ==
 set GGML_CUDA_FATTN_VEC_NATIVE=1
-%B% -m %M% -f %F% %COMMON% -ctk turbo5_0 -ctv turbo3_0
+%B% -m %M% -f %F% %COMMON% -ctk turbo5 -ctv turbo3
 set GGML_CUDA_FATTN_VEC_NATIVE=
 
 echo == T7 turbo5-turbo3 NATIVE vec + FUSED f16-MMA KQ (S2 gate row) ==
 set GGML_CUDA_FATTN_VEC_NATIVE=1
 set GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=1
-%B% -m %M% -f %F% %COMMON% -ctk turbo5_0 -ctv turbo3_0
+%B% -m %M% -f %F% %COMMON% -ctk turbo5 -ctv turbo3
 set GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=
 set GGML_CUDA_FATTN_VEC_NATIVE=
 endlocal

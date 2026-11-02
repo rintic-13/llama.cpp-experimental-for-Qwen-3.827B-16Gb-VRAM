@@ -42,8 +42,9 @@ static bool ggml_cuda_fattn_vec_kq_mma_f16_enabled() {
 // TURBO5_0).  K stays in the raw turbo cache bytes (mux centroid decode + dither + norm folded
 // into the f16 A fragments), Q is the same unquantized f32->f16 B fragment set.
 // Unlike nvfp4 the turbo numerics change vs the q8_1 dot path (f16 rounding of K*norm and Q),
-// so the compile default is OFF until the PPL gate passes; env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=1
-// turns it on for probing (0 forces the q8_1 dot path if the default flips).
+// so the compile default was OFF until the PPL gate passed; since 2026-11-03 it is ON
+// (SS12: T5==T2 exactly, dPPL(T7-T6) = -0.0052). env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=0/1
+// overrides it at runtime (0 forces the q8_1 dot path for A/B).
 // SPEED GATE (fa_turbo_ab_probe, idle GPU, §12): fused beats the q8_1 dot only for the dither-free
 // heavy-K decoders (turbo5 -12%); for TURBO4_0 K the 4-lane subtractive dither makes fused 35%
 // (D256) / 71% (D128) SLOWER than the dot+range-dither path, so the runtime selector excludes

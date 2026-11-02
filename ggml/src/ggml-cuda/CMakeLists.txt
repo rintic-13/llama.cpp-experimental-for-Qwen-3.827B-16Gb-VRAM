@@ -162,9 +162,10 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_FATTN_VEC_KQ_MMA_F16_DEFAULT=0)
     endif()
 
-    # S2: same fused f16-MMA KQ^T for the turbo K types (TURBO4/5/4Q). Compile default OFF until
-    # the SS12 PPL gate passes (NVFP4_FA_RESEARCH.md); env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=0/1
-    # overrides at runtime (0 = q8_1 dot fallback for A/B and debugging).
+    # S2: same fused f16-MMA KQ^T for the turbo K types (TURBO4/TURBO5). Compile default ON since the
+    # SS12 PPL gate passed (2026-11-03: T5==T2 exactly, dPPL(T7-T6) = -0.0052); the runtime selector in
+    # fattn-vec.cuh keeps the fused path to TURBO5_0 K (turbo4 K stays on q8_1 dot + range dither, it is
+    # 35%/71% slower there). env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=0/1 overrides at runtime.
     if (GGML_CUDA_FATTN_TURBO_KQ_MMA_F16)
         add_compile_definitions(GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT=1)
     else()
