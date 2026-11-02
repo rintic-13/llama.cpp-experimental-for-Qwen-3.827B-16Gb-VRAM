@@ -1021,6 +1021,29 @@ Gate plan (user runs, GPU idle per policy):
    currently routed to f16-scratch, routing re-measure R1-R6 runs first).
 3. If both pass: flip GGML_CUDA_FATTN_TURBO_KQ_MMA_F16 default ON + record numbers here.
 
+### §12 gate round 1 (2026-11-02): the "mapping bug" was a HARNESS ARTIFACT - fused numerics look fine
+
+- First fused run printed max-rel 7e1..4e3 + "every valid output differs" -> mapped as the §10j mispairing
+  alarm. It was NOT: (a) cmp_path compared the RAW gridDim.y partial outputs - the vec kernel writes
+  UNNORMALIZED per-tile partials (`dst[((head*gridDim.y)+blockIdx.y)*D+i]`, finish-kernel normalizes later),
+  so partial sums with cancellation produce garbage max-rel for ANY numerics change; (b) three of six pairs
+  even used the wrong K/V reference (T7/T8/T9 vs snapT1).
+- tools/fa_turbo_frag_probe.cu (new, unit-tests kq_afrag against the element reference coord-by-coord,
+  value->coord locator on mismatch): 0/192 mismatches for turbo4 (2 norm sets), turbo5, turbo4q - the
+  fragment builder is bitwise-correct.
+- Fixed cmp harness: host-side merge of the pb partials (mirrors flash_attn_ext_finish) + correct pairs
+  (T6vsT1, T7vsT3, T8vsT4, T9vsT5, C2vsC1, C4vsC3). Result: absolute output deltas are ~1e-6..8e-6, i.e.
+  exactly the predicted f16-rounding noise scale ~1e-3*sigmaV/sqrt(N) - fused numerics CONFIRMED sane at
+  probe level. max-rel is meaningless for near-zero outputs; the production gate is PPL (step 2 above).
+- Speed (idle-GPU numbers, both runs agree): D256 t4 fused 1.91ms vs dot 1.41 (SLOWER, dither), t5 1.50 vs
+  1.70, t4q 1.29 vs 1.49; D128 t4 0.84 vs 0.50 (SLOWER), t4q 0.47 vs 0.53. turbo4 fused pays the 4-lane
+  dither redundancy (each lane recomputes a 4-word its pair-lane already hashed); t5/t4q (no dither) win
+  ~1.13x. Option S2b-lite: shuffle the dither words between pair lanes (tg0<->tg1, tg2<->tg3) to halve
+  dither cost, or fuse only t5/t4q K. PENDING: PPL gate + routing decision.
+- Note: fa_turbo_ab_new.exe T2(q5_1) fnv differs from the 14:38 build's run (14650fb0 vs 18050523) but is
+  stable across runs of the current exe; T2 has no snapshot and its bitwise gate was via DUMP comparison
+  (identical=True in the dump_old/dump_new run), so this does not affect any gate. Unexplained, low prio.
+
 ## Reproduce
 
 ```
@@ -1053,4 +1076,7 @@ tools\fa_turbo_ab_probe.cu  # turbo vec-kernel A/B: production flash_attn_ext_ve
                             # rebuild_turbo_ab_both.cmd (header swap via git show HEAD) -> fa_turbo_ab_old/new.exe,
                             # run each with a dump dir arg, then per-row: Get-FileHash must match, timing should drop.
                             # nvcc flags include -DGGML_TURBO_DITHER (production dither) + sm_120a.
+tools\fa_turbo_frag_probe.cu # S2 fragment unit probe: ggml_cuda_fattn_turbo_kq_afrag vs the element reference
+                            # for every (f,tg,slot,half); on mismatch prints which coord the fragment word really
+                            # holds (§12). Tiny standalone run; same nvcc flags as the ab probe.
 ```

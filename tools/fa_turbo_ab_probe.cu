@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <cfloat>
 #include <vector>
 #include <algorithm>
 #include <cuda_fp16.h>
@@ -167,7 +168,36 @@ static void variant(const char * name, const char * Kc, const char * Vc, int nb1
         const uint8_t * q = (const uint8_t *) hm.data();
         for (size_t i = 0; i < hm.size()*sizeof(float2); ++i) { fnv = (fnv ^ q[i]) * 1099511628211ull; }
         if (snap) {
-            snap->swap(hd);   // meta is deliberately NOT snapshotted (max/sum reorder freely with fused)
+            // Merge the gridDim.y parallel partials exactly like flash_attn_ext_vec_finish:
+            // dst slot ((head*pb + t)*D + i) holds the UNNORMALIZED VKQ sum of KV-slice t with
+            // running max/sum in meta[head*pb + t].  Comparing raw partials across paths is
+            // meaningless (unnormalized sums, catastrophic cancellation -> bogus max-rel);
+            // compare the normalized single-token attention output instead.
+            const int pb = parallel_blocks;
+            std::vector<float> merged((size_t) NQ * NHEAD * D);
+            for (int q = 0; q < NQ; ++q) {
+                for (int h = 0; h < NHEAD; ++h) {
+                    const size_t mbase = ((size_t) q * NHEAD + h) * pb;
+                    float gm = -FLT_MAX;
+                    for (int t = 0; t < pb; ++t) {
+                        gm = std::max(gm, hm[mbase + t].x);
+                    }
+                    double denom = 0.0;
+                    for (int t = 0; t < pb; ++t) {
+                        denom += (double) hm[mbase + t].y * exp((double) hm[mbase + t].x - gm);
+                    }
+                    const float inv = (float) (denom != 0.0 ? 1.0 / denom : 0.0);
+                    float * out = merged.data() + ((size_t) q * NHEAD + h) * D;
+                    for (int i = 0; i < D; ++i) {
+                        double acc = 0.0;
+                        for (int t = 0; t < pb; ++t) {
+                            acc += (double) hd[(mbase + t) * D + i] * exp((double) hm[mbase + t].x - gm);
+                        }
+                        out[i] = (float) (acc * inv);
+                    }
+                }
+            }
+            snap->swap(merged);
         }
     }
 
@@ -256,11 +286,11 @@ int main(int argc, char ** argv) {
     variant<D128, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  false>("C3_d128-t4qt4",   Kt4qs, Vt4s, NB_TURBO4Q_128, NB_TURBO4_128,  Q, dst, meta, nsm, reps, &snapC3);
     variant<D128, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  true >("C4_d128fused4q",  Kt4qs, Vt4s, NB_TURBO4Q_128, NB_TURBO4_128,  Q, dst, meta, nsm, reps, &snapC4);
 
-    printf("\nS2 numerics sanity (fused != dot BY DESIGN; max rel should be ~1e-3, NOT ~1e+0):\n");
+    printf("\nS2 numerics sanity (fused != dot BY DESIGN; merged partials, max rel should be ~1e-3, NOT ~1e+0):\n");
     cmp_path("t4-t3  D256", snapT1, snapT6);
-    cmp_path("t4-t4  D256", snapT1, snapT7);   // note: different V, only K-side change expected
-    cmp_path("t5-t3  D256", snapT1, snapT8);
-    cmp_path("t4q-t4 D256", snapT1, snapT9);
+    cmp_path("t4-t4  D256", snapT3, snapT7);   // correct pair: K=t4, V=t4
+    cmp_path("t5-t3  D256", snapT4, snapT8);   // correct pair: K=t5, V=t3
+    cmp_path("t4q-t4 D256", snapT5, snapT9);   // correct pair: K=t4q, V=t4
     cmp_path("t4-t3  D128", snapC1, snapC2);
     cmp_path("t4q-t4 D128", snapC3, snapC4);
 

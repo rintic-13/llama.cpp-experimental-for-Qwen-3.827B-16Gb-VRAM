@@ -21,19 +21,21 @@ function Run-Row($name, $kv, $envvar) {
     if ($envvar -eq "NATIVE")   { $env:GGML_CUDA_FATTN_VEC_NATIVE = "1" }
     if ($envvar -eq "FALLBACK") { $env:GGML_CUDA_FATTN_VEC_FALLBACK = "1" }
     $env:GGML_FATTN_DEBUG = "1"
-    Write-Host "==================== $name ($kv, routing=$envvar) ====================" -ForegroundColor Cyan
-    & $bench -m $model -ngl 99 -fa on -t 7 -ub 512 $kv -pg "512,128;4096,128" -r 2
+    Write-Host "==================== $name ($($kv -join ' '), routing=$envvar) ====================" -ForegroundColor Cyan
+    # NB: $kv must be a STRING ARRAY - a single quoted string ("-ctk x -ctv y") becomes ONE argv entry
+    # and llama-bench dies with "invalid parameter for argument".  Array elements splat as separate args.
+    & $bench -m $model -ngl 99 -fa on -t 7 -ub 512 @kv -pg "512,128;4096,128" -r 2
     Clear-Env
 }
 
 Write-Host "GPU state (check first; abort if foreign VRAM users):" -ForegroundColor Yellow
 nvidia-smi --query-gpu=memory.used,memory.free,utilization.gpu --format=csv
 
-Run-Row "R1 turbo4-turbo3  GATE-ON (current default)" "-ctk turbo4_0 -ctv turbo3_0" ""
-Run-Row "R2 turbo4-turbo3  NATIVE vec (S1 kernel)"     "-ctk turbo4_0 -ctv turbo3_0" "NATIVE"
-Run-Row "R3 q5_1-turbo3    NATIVE (default, S1)"       "-ctk q5_1     -ctv turbo3_0" ""
-Run-Row "R4 q5_1-turbo3    FALLBACK f16-scratch"       "-ctk q5_1     -ctv turbo3_0" "FALLBACK"
-Run-Row "R5 turbo4q-turbo4 GATE-ON (default)"          "-ctk turbo4q_0 -ctv turbo4_0" ""
-Run-Row "R6 turbo4q-turbo4 NATIVE vec"                 "-ctk turbo4q_0 -ctv turbo4_0" "NATIVE"
+Run-Row "R1 turbo4-turbo3  GATE-ON (current default)" @("-ctk","turbo4_0","-ctv","turbo3_0") ""
+Run-Row "R2 turbo4-turbo3  NATIVE vec (S1 kernel)"     @("-ctk","turbo4_0","-ctv","turbo3_0") "NATIVE"
+Run-Row "R3 q5_1-turbo3    NATIVE (default, S1)"       @("-ctk","q5_1","-ctv","turbo3_0") ""
+Run-Row "R4 q5_1-turbo3    FALLBACK f16-scratch"       @("-ctk","q5_1","-ctv","turbo3_0") "FALLBACK"
+Run-Row "R5 turbo4q-turbo4 GATE-ON (default)"          @("-ctk","turbo4q_0","-ctv","turbo4_0") ""
+Run-Row "R6 turbo4q-turbo4 NATIVE vec"                 @("-ctk","turbo4q_0","-ctv","turbo4_0") "NATIVE"
 Write-Host "Compare pp512/pp4096/tg128 columns across pairs (R1vsR2, R3vsR4, R5vsR6)."
 Write-Host "Expectation post-S1: tg128 R2 ~2x R1 (probe: vec 2.89->1.42ms); pp roughly tie (both do one convert per prefill call, not per token)."
