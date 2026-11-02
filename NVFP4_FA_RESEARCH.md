@@ -1055,8 +1055,9 @@ Idle-GPU timings reproduced across 3 runs (fa_turbo_ab_new med ms, D=256 | D=128
 Break-even analysis: t4q fused (dither-free) = 1.29 is the floor for a hypothetical ZERO-dither t4 fused;
 the dither (~0.5ms at D256) cannot be made free (v2 generator is already 1 avalanche + 2 wide IMADs per
 4-coord word; per-lane half-hash or pair-lane shuffles save at most ~half), and the dp4a dot +
-turbo_dither_range path stays cheaper for t4. S2b-lite NOT implemented; decision implemented in
-fattn-vec.cuh instead: kq_f16_sel excludes TURBO4_0 unless env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1
+turbo_dither_range path stays cheaper for t4.  **SUPERSEDED 2026-11-03:** that ~0.5 ms was NOT hash ALU -
+it is a 64 B/thread spill of the dither arrays; see the spill-forensics section at the end of §12.
+S2b-lite NOT implemented; decision implemented infattn-vec.cuh instead: kq_f16_sel excludes TURBO4_0 unless env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1
 (experiment override; probe T6/C2 rows instantiate the template directly and still measure the t4 fused
 path). ppl_quick_turbo.cmd updated: T7-vs-T6 (t5) is the real numerics gate, T5-vs-T2 must be exactly
 equal (selector-exclusion proof). PENDING: PPL run + routing R1-R4 (user, idle GPU).
@@ -1169,6 +1170,49 @@ turbo5-turbo3, nothing else set):
 +1.8% end-to-end decode, prefill untouched (the probe's -12% is the KQ block only; at d8192 the rest of
 the graph dominates, so the realized win is 1.8%). Small but free and numerically gated - and it was
 already being collected in production because decode always runs the vec kernel (see R1-R4).
+
+### §12 WHY fused was slower on turbo4: it is SPILLING, not the algorithm (2026-11-03 forensics)
+
+User hypothesis (Triton analogy: BLOCK_M/N/K must keep the working fragments inside the SM register file,
+otherwise 1.5-2x slowdown from (a) register spilling to local memory, (b) occupancy loss). Measured on
+`fa_turbo_ab_new.exe` with `cuobjdump -res-usage` / `-sass -fun` (full tables in
+FA_TURBO_BASELINE_20261103.md §1b):
+
+| variant | REG | STACK/thread | LDL+STL | result |
+|---------|-----|--------------|---------|--------|
+| t4–t3 dot D256 | 255 | 0 | 0 | 1.412 ms |
+| t4–t3 FUSED D256 | 255 | **64 B** | **256** | 1.925 ms (+36.3 %) |
+| t4–t4 FUSED D256 | 253 | **64 B** | - | 1.964 ms |
+| t4–t3 FUSED D128 | 254 | **64 B** | - | 0.855 ms (+70.0 %) |
+| t5–t3 dot D256 | 254 | 0 | 0 | 1.697 ms |
+| t5–t3 FUSED D256 | 255 | **0** | **0** | 1.503 ms (-11.4 %) |
+
+The hypothesis is confirmed, with one important refinement about WHICH mechanism is live here:
+- (b) occupancy is NOT the differentiator: REG is 253-255 in EVERY variant, i.e. the 65536 reg/SM file is
+  already saturated by the 255/thread cap and occupancy is register-pinned at 2 blocks/SM in both paths
+  (smem 5376 vs 5888 B is far from the limit). Extra live state therefore CANNOT cost blocks/SM - the
+  compiler has nowhere to put it.
+- (a) spilling is exactly what happens, and it correlates 1:1 with the loss: the only slow variants are
+  the only ones with a stack frame (64 B/thread) and LDL/STL traffic in SASS (256 accesses). The fused
+  KQ block itself is cheaper than the dot path (32 HMMA instead of the dp4a+decode chain, FFMA 1741 ->
+  1390, SHFL 199 -> 44, static total 12488 -> 13688) - the algorithm is fine.
+
+ROOT CAUSE: fattn-vec.cuh:103 in the TURBO4_0 branch of ggml_cuda_fattn_turbo_kq_afrag -
+  `float du0[4], du1[4], dv0[4], dv1[4];` passed BY ADDRESS to turbo_dither4(...) (out-param array) and
+  then indexed by `kl = 2*(tg & 1)`, a RUNTIME index derived from the lane id. 4 arrays x 4 floats =
+  64 B/thread = exactly the reported STACK:64. nvcc cannot scalar-replace an address-taken array indexed
+  by a runtime value, so the whole dither group lives in local memory and is re-read per fragment.
+  turbo5 (no dither -> no arrays) shows STACK:0 / LDL:0 and IS FASTER than its dot path: it was the
+  dither's storage class, not the MMA, that cost 36-70 %.
+
+FIX (S2c, register-only dither; NOT implemented yet): keep turbo_dither4's exact value sequence but
+return the group as 4 named scalars (struct/float4) instead of `float * u`, and pick the pair with a bool
+from `tg & 1` (predicated register select - kl is only ever 0 or 2). Expect STACK:0 and LDL/STL:0 on the
+t4 fused instantiations. Ceiling to aim at = the zero-dither floor already measured with turbo4q fused
+(1.293 ms D256 / 0.469 ms D128) against 1.412 / 0.503 for the dot path, i.e. turbo4 fused could land ~8 %
+FASTER than dot and the per-type selector exclusion would go away. Order of verification: cuobjdump must
+show STACK:0 first, then fa_turbo_ab_new T6/C2 rows, then the PPL rows - all compared against
+FA_TURBO_BASELINE_20261103.md.
 
 ## Reproduce
 
