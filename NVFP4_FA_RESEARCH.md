@@ -1289,6 +1289,20 @@ not caused by the cap - but that shape was never timed, so it stays at min_block
 ncol=1 turbo-D256 rows sit at REG=168 (STACK 0; the two softcap t5t4 dot variants spill 8 B, a shape
 this model never calls), the 36 ncol=2 turbo-D256 rows and every non-turbo instantiation unchanged.
 
+IDLE-GPU CONFIRMATION (run_s2c_gate.cmd re-run 2026-11-03 with the FINAL-policy probe, GPU 0 MiB used
+/ 16 050 free / 0 %, two reps + global-MB3 probe): the busy-header run above was indeed uncontaminated -
+every number reproduced. Final policy (med ms, r1/r2): T1 1.099/1.105, T2 0.670/0.671 (= baseline 0.669,
+policy leaves q5_1 at MB1), T3 1.086/1.091, T4 1.420/1.431, T6 1.067/1.067, T7 1.058/1.058, T8
+1.177/1.194, C1 0.504/0.503 (= baseline), C2 0.491/0.491. Fused still wins every turbo row: T6 is 3 %
+under its own T1 dot, T7 2.7 % under T3, T8 17 % under T4, C2 2.4 % under C1. Global MB3 again shows
+the avoided regressions (T2 0.678, C1 0.509). HASH DRIFT note: the fnv output hashes of turbo rows
+change between builds with different register budgets (T1 16967c5c @MB1 -> 33b6fa5e @MB3) although the
+dot SOURCE is unchanged - register pressure changes ptxas scheduling/FMA contraction, i.e. last-ULP
+reduction differences; the q5_1 anchor kernel hash 14650fb0 is identical across all three builds. This
+does not violate the bitwise gate (frag probe 0/0/0 = dither/fragment values), but it means the S1-era
+"dot row is bitwise" reference no longer holds for the MB3 rows - which is exactly why the final PPL
+rows must run against the final DLL (run_s2d_gate.cmd).
+
 NOT YET MEASURED: fused-t4 PPL (at S2 close T5==T2==7.1802 EXACTLY, i.e. that run proved the exclusion,
 not fused-t4 quality). run_s2d_gate.cmd step 3 measures T8 (NATIVE, fused default) vs T9 (NATIVE, forced
 dot); gate |delta| <= 0.05 against the 7.1802 dot reference. Step 4 is the production A/B at d8192.
