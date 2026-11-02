@@ -12,10 +12,15 @@
 //   T3 turbo4_0 K + turbo4_0 V, dot
 //   T4 turbo5_0 K + turbo3_0 V, dot
 //   T5 turbo4q_0 K + turbo4_0 V, dot
+//   T6..T9 same K/V pairs with the S2 fused f16-MMA KQ path (KQ_f16dq=true) - timing only, the
+//   numerics intentionally change (f16 K/Q rounding like nvfp4 fused), so their dumps are NOT
+//   bitwise-compared across exes; the PPL gate validates them instead.
+//   C* rows: D=128 (production head size) dot vs fused pairs + host max-diff reports.
 // Launch config replicated exactly from launch_fattn(): occupancy query + parallel_blocks loop.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include <algorithm>
 #include <cuda_fp16.h>
@@ -25,18 +30,22 @@
 
 #define CK(x) do { cudaError_t e=(x); if(e){printf("cuda err %s @%d\n",cudaGetErrorString(e),__LINE__);exit(1);} } while(0)
 
-static const int D = 256;
+static const int D256 = 256;
+static const int D128 = 128;
 static const int NQ = 1;
 static const int NHEAD = 24;      // q heads
 static const int NKVH  = 4;       // kv heads
 static const int NKV   = 32768;   // cache length (d32768)
 
-// row bytes at D=256 (2 quant blocks per row)
-static const int NB_TURBO4  = 2*(int) sizeof(block_turbo4_0);   // 132
-static const int NB_TURBO3  = 2*(int) sizeof(block_turbo3_0);   // 100
-static const int NB_TURBO5  = 2*(int) sizeof(block_turbo5_0);   // 164
-static const int NB_TURBO4Q = 2*(int) sizeof(block_turbo4q_0);  // 136
-static const int NB_Q51     = (D/QK5_1)*(int) sizeof(block_q5_1);
+// row bytes at D=256 / D=128 (2 / 1 quant blocks per row)
+static const int NB_TURBO4_256  = 2*(int) sizeof(block_turbo4_0);   // 132
+static const int NB_TURBO3_256  = 2*(int) sizeof(block_turbo3_0);   // 100
+static const int NB_TURBO5_256  = 2*(int) sizeof(block_turbo5_0);   // 164
+static const int NB_TURBO4Q_256 = 2*(int) sizeof(block_turbo4q_0);  // 136
+static const int NB_Q51_256     = (D256/QK5_1)*(int) sizeof(block_q5_1);
+static const int NB_TURBO4_128  = (int) sizeof(block_turbo4_0);
+static const int NB_TURBO3_128  = (int) sizeof(block_turbo3_0);
+static const int NB_TURBO4Q_128 = (int) sizeof(block_turbo4q_0);
 
 // benign cache: random index bytes, half-norms patched to 0.25 (and rnorm for Q_prod) so all
 // decoded values are finite and moderate. norm (and rnorm) are the first fields of every block.
@@ -54,9 +63,9 @@ static std::vector<uint8_t> make_turbo_cache(size_t row_bytes, int blk_bytes, in
 }
 
 static std::vector<uint8_t> make_q51_cache() {
-    std::vector<uint8_t> h((size_t) NKVH * NKV * NB_Q51);
+    std::vector<uint8_t> h((size_t) NKVH * NKV * NB_Q51_256);
     unsigned s = 5;
-    for (int blk = 0; blk < NKVH*NKV*(D/QK5_1); ++blk) {
+    for (int blk = 0; blk < NKVH*NKV*(D256/QK5_1); ++blk) {
         uint8_t * b = h.data() + (size_t) blk*sizeof(block_q5_1);
         const __half d = __float2half(0.25f), m = __float2half(0.0f);
         uint16_t dh, mh; memcpy(&dh, &d, 2); memcpy(&mh, &m, 2);
@@ -80,11 +89,12 @@ static const uint3 probe_fastdiv(uint64_t d_64) {
 
 static char g_dump_dir[512] = "";
 
-template <ggml_type TK, ggml_type TV>
+template <int D, ggml_type TK, ggml_type TV, bool FUSED>
 static void variant(const char * name, const char * Kc, const char * Vc, int nb11, int nb21,
-                    const float * Q, float * dst, float2 * meta, int nsm, int reps) {
-    typedef decltype(&flash_attn_ext_vec<D, 1, TK, TV, false, false, false>) kern_t;
-    kern_t kern = &flash_attn_ext_vec<D, 1, TK, TV, false, false, false>;
+                    const float * Q, float * dst, float2 * meta, int nsm, int reps,
+                    std::vector<float> * snap = nullptr) {
+    typedef decltype(&flash_attn_ext_vec<D, 1, TK, TV, false, false, FUSED>) kern_t;
+    kern_t kern = &flash_attn_ext_vec<D, 1, TK, TV, false, false, FUSED>;
 
     cudaFuncAttributes fa{}; CK(cudaFuncGetAttributes(&fa, (const void *)kern));
 
@@ -139,21 +149,26 @@ static void variant(const char * name, const char * Kc, const char * Vc, int nb1
 
     // dump the final output (the last launch left the correct result in dst/meta) for bitwise diff
     uint64_t fnv = 1469598103934665603ull;
-    if (g_dump_dir[0]) {
-        const size_t ndst = (size_t) ntiles_KV * D * NQ * NHEAD;   // worst-case tile count
+    const size_t ndst = (size_t) ntiles_KV * D * NQ * NHEAD;   // worst-case tile count
+    if (g_dump_dir[0] || snap) {
         std::vector<float> hd(ndst);
         CK(cudaMemcpy(hd.data(), dst, ndst*4, cudaMemcpyDeviceToHost));
         std::vector<float2> hm((size_t) ntiles_KV * NQ * NHEAD);
         CK(cudaMemcpy(hm.data(), meta, hm.size()*sizeof(float2), cudaMemcpyDeviceToHost));
-        char path[700]; snprintf(path, sizeof(path), "%s\\%s.bin", g_dump_dir, name);
-        FILE * f = fopen(path, "wb");
-        if (!f) { printf("dump open fail %s\n", path); exit(1); }
-        fwrite(hd.data(), 4, ndst, f); fwrite(hm.data(), sizeof(float2), hm.size(), f);
-        fclose(f);
+        if (g_dump_dir[0]) {
+            char path[700]; snprintf(path, sizeof(path), "%s\\%s.bin", g_dump_dir, name);
+            FILE * f = fopen(path, "wb");
+            if (!f) { printf("dump open fail %s\n", path); exit(1); }
+            fwrite(hd.data(), 4, ndst, f); fwrite(hm.data(), sizeof(float2), hm.size(), f);
+            fclose(f);
+        }
         const uint8_t * p = (const uint8_t *) hd.data();
         for (size_t i = 0; i < ndst*4; ++i) { fnv = (fnv ^ p[i]) * 1099511628211ull; }
         const uint8_t * q = (const uint8_t *) hm.data();
         for (size_t i = 0; i < hm.size()*sizeof(float2); ++i) { fnv = (fnv ^ q[i]) * 1099511628211ull; }
+        if (snap) {
+            snap->swap(hd);   // meta is deliberately NOT snapshotted (max/sum reorder freely with fused)
+        }
     }
 
     printf("%-26s occ=%d pb=%d regs=%d smem=%zuB | med %7.3f ms  min %7.3f max %7.3f | %6.2f t/s-equiv | fnv %016llx\n",
@@ -161,22 +176,38 @@ static void variant(const char * name, const char * Kc, const char * Vc, int nb1
         med, ms.front(), ms.back(), tok_per_s, (unsigned long long) fnv);
 }
 
+// numerical A/B between the dot and fused paths (fused changes numerics by design: report the
+// magnitude of the change; the production gate is PPL, this line is the sanity bound).
+static void cmp_path(const char * name, const std::vector<float> & a, const std::vector<float> & b) {
+    size_t ndiff = 0; double max_rel = 0.0; float ma = 0, mb = 0;
+    const size_t n = a.size() < b.size() ? a.size() : b.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] == b[i]) continue;
+        ++ndiff;
+        const double den = std::fabs((double) a[i]) > 1e-30 ? std::fabs((double) a[i]) : 1e-30;
+        const double rel = std::fabs((double) a[i] - (double) b[i]) / den;
+        if (rel > max_rel) { max_rel = rel; ma = a[i]; mb = b[i]; }
+    }
+    printf("  fused-vs-dot %-22s differing=%zu/%zu  max rel=%.3e (%.6g vs %.6g)\n",
+           name, ndiff, n, max_rel, ma, mb);
+}
+
 int main(int argc, char ** argv) {
     if (argc > 1) { snprintf(g_dump_dir, sizeof(g_dump_dir), "%s", argv[1]); }
     int dev = 0; cudaDeviceProp dp{}; CK(cudaGetDeviceProperties(&dp, dev));
-    printf("GPU: %s SMs=%d cc=%d.%d  (probe: flash_attn_ext_vec D=256 nq=1 nkv=%d heads=%d/%d, turbo A/B)\n",
+    printf("GPU: %s SMs=%d cc=%d.%d  (probe: flash_attn_ext_vec nq=1 nkv=%d heads=%d/%d, turbo A/B + S2 fused)\n",
         dp.name, dp.multiProcessorCount, dp.major, dp.minor, NKV, NHEAD, NKVH);
 
     // Q random small
-    std::vector<float> hq(NHEAD * NQ * D);
+    std::vector<float> hq(NHEAD * NQ * D256);
     unsigned s = 3;
     for (auto & x : hq) { s = s*1664525u + 1013904223u; x = ((int)(s >> 9) % 4000 - 2000) / 1000.0f; }
     float * Q; CK(cudaMalloc(&Q, hq.size()*4)); CK(cudaMemcpy(Q, hq.data(), hq.size()*4, cudaMemcpyHostToDevice));
 
-    const auto t4  = make_turbo_cache(NB_TURBO4,  sizeof(block_turbo4_0),  1, 11);
-    const auto t3  = make_turbo_cache(NB_TURBO3,  sizeof(block_turbo3_0),  1, 13);
-    const auto t5  = make_turbo_cache(NB_TURBO5,  sizeof(block_turbo5_0),  1, 17);
-    const auto t4q = make_turbo_cache(NB_TURBO4Q, sizeof(block_turbo4q_0), 2, 19);
+    const auto t4  = make_turbo_cache(NB_TURBO4_256,  sizeof(block_turbo4_0),  1, 11);
+    const auto t3  = make_turbo_cache(NB_TURBO3_256,  sizeof(block_turbo3_0),  1, 13);
+    const auto t5  = make_turbo_cache(NB_TURBO5_256,  sizeof(block_turbo5_0),  1, 17);
+    const auto t4q = make_turbo_cache(NB_TURBO4Q_256, sizeof(block_turbo4q_0), 2, 19);
     const auto q51 = make_q51_cache();
 
     char *Kt4, *Kt5, *Kt4q, *Kq51, *Vt3, *Vt4;
@@ -187,16 +218,51 @@ int main(int argc, char ** argv) {
     CK(cudaMalloc(&Vt3,  t3.size()));  CK(cudaMemcpy(Vt3,  t3.data(),  t3.size(),  cudaMemcpyHostToDevice));
     CK(cudaMalloc(&Vt4,  t4.size()));  CK(cudaMemcpy(Vt4,  t4.data(),  t4.size(),  cudaMemcpyHostToDevice));
 
-    const int maxpb = (NKV + D - 1) / D;
-    float * dst;  CK(cudaMalloc(&dst,  (size_t)maxpb * D * NQ * NHEAD * 4));  CK(cudaMemset(dst, 0, (size_t)maxpb * D * NQ * NHEAD * 4));
-    float2 * meta; CK(cudaMalloc(&meta, (size_t)maxpb * NQ * NHEAD * sizeof(float2))); CK(cudaMemset(meta, 0, (size_t)maxpb * NQ * NHEAD * sizeof(float2)));
+    // D=128 caches (1 block per row, same seeds so values match the D=256 cache first halves)
+    const auto t4s  = make_turbo_cache(NB_TURBO4_128,  sizeof(block_turbo4_0),  1, 11);
+    const auto t3s  = make_turbo_cache(NB_TURBO3_128,  sizeof(block_turbo3_0),  1, 13);
+    const auto t4qs = make_turbo_cache(NB_TURBO4Q_128, sizeof(block_turbo4q_0), 2, 19);
+    char *Kt4s, *Kt4qs, *Vt3s, *Vt4s;
+    CK(cudaMalloc(&Kt4s,  t4s.size()));  CK(cudaMemcpy(Kt4s,  t4s.data(),  t4s.size(),  cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&Kt4qs, t4qs.size())); CK(cudaMemcpy(Kt4qs, t4qs.data(), t4qs.size(), cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&Vt3s,  t3s.size()));  CK(cudaMemcpy(Vt3s,  t3s.data(),  t3s.size(),  cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&Vt4s,  t4s.size()));  CK(cudaMemcpy(Vt4s,  t4s.data(),  t4s.size(),  cudaMemcpyHostToDevice));
 
+    const int maxpb256 = (NKV + D256 - 1) / D256;
+    const int maxpb128 = (NKV + D128 - 1) / D128;
+    const size_t maxdst = (size_t) maxpb128 * D128 * NQ * NHEAD;   // == maxpb256*D256*NQ*NHEAD
+    float * dst;  CK(cudaMalloc(&dst,  maxdst * 4));  CK(cudaMemset(dst, 0, maxdst * 4));
+    float2 * meta; CK(cudaMalloc(&meta, (size_t) maxpb128 * NQ * NHEAD * sizeof(float2)));
+    CK(cudaMemset(meta, 0, (size_t) maxpb128 * NQ * NHEAD * sizeof(float2)));
+
+    const int nsm = dp.multiProcessorCount;
     const int reps = 11;
-    variant<GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0>("T1_turbo4-t3",         Kt4,  Vt3, NB_TURBO4, NB_TURBO3, Q, dst, meta, dp.multiProcessorCount, reps);
-    variant<GGML_TYPE_Q5_1,     GGML_TYPE_TURBO3_0>("T2_q5_1-t3",           Kq51, Vt3, NB_Q51,    NB_TURBO3, Q, dst, meta, dp.multiProcessorCount, reps);
-    variant<GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>("T3_turbo4-t4",         Kt4,  Vt4, NB_TURBO4, NB_TURBO4, Q, dst, meta, dp.multiProcessorCount, reps);
-    variant<GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0>("T4_turbo5-t3",         Kt5,  Vt3, NB_TURBO5, NB_TURBO3, Q, dst, meta, dp.multiProcessorCount, reps);
-    variant<GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0>("T5_turbo4q-t4",        Kt4q, Vt4, NB_TURBO4Q,NB_TURBO4, Q, dst, meta, dp.multiProcessorCount, reps);
+    std::vector<float> snapT1, snapT3, snapT4, snapT5, snapT6, snapT7, snapT8, snapT9, snapC1, snapC2, snapC3, snapC4;
+
+    // ---- D=256 decode-shape rows (bitwise gate rows T1..T5 must keep byte-identical dumps) ----
+    variant<D256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0,  false>("T1_turbo4-t3",    Kt4,  Vt3, NB_TURBO4_256,  NB_TURBO3_256,  Q, dst, meta, nsm, reps, &snapT1);
+    variant<D256, GGML_TYPE_Q5_1,     GGML_TYPE_TURBO3_0,  false>("T2_q5_1-t3",      Kq51, Vt3, NB_Q51_256,     NB_TURBO3_256,  Q, dst, meta, nsm, reps);
+    variant<D256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0,  false>("T3_turbo4-t4",    Kt4,  Vt4, NB_TURBO4_256,  NB_TURBO4_256,  Q, dst, meta, nsm, reps, &snapT3);
+    variant<D256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0,  false>("T4_turbo5-t3",    Kt5,  Vt3, NB_TURBO5_256,  NB_TURBO3_256,  Q, dst, meta, nsm, reps, &snapT4);
+    variant<D256, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  false>("T5_turbo4q-t4",   Kt4q, Vt4, NB_TURBO4Q_256, NB_TURBO4_256,  Q, dst, meta, nsm, reps, &snapT5);
+    variant<D256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0,  true >("T6_fused-t4t3",   Kt4,  Vt3, NB_TURBO4_256,  NB_TURBO3_256,  Q, dst, meta, nsm, reps, &snapT6);
+    variant<D256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0,  true >("T7_fused-t4t4",   Kt4,  Vt4, NB_TURBO4_256,  NB_TURBO4_256,  Q, dst, meta, nsm, reps, &snapT7);
+    variant<D256, GGML_TYPE_TURBO5_0, GGML_TYPE_TURBO3_0,  true >("T8_fused-t5t3",   Kt5,  Vt3, NB_TURBO5_256,  NB_TURBO3_256,  Q, dst, meta, nsm, reps, &snapT8);
+    variant<D256, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  true >("T9_fused-t4qt4",  Kt4q, Vt4, NB_TURBO4Q_256, NB_TURBO4_256,  Q, dst, meta, nsm, reps, &snapT9);
+
+    // ---- D=128 rows (production head size): dot vs fused numerical A/B ----
+    variant<D128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0,  false>("C1_d128-t4t3",    Kt4s,  Vt3s, NB_TURBO4_128,  NB_TURBO3_128,  Q, dst, meta, nsm, reps, &snapC1);
+    variant<D128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0,  true >("C2_d128fused",    Kt4s,  Vt3s, NB_TURBO4_128,  NB_TURBO3_128,  Q, dst, meta, nsm, reps, &snapC2);
+    variant<D128, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  false>("C3_d128-t4qt4",   Kt4qs, Vt4s, NB_TURBO4Q_128, NB_TURBO4_128,  Q, dst, meta, nsm, reps, &snapC3);
+    variant<D128, GGML_TYPE_TURBO4Q_0,GGML_TYPE_TURBO4_0,  true >("C4_d128fused4q",  Kt4qs, Vt4s, NB_TURBO4Q_128, NB_TURBO4_128,  Q, dst, meta, nsm, reps, &snapC4);
+
+    printf("\nS2 numerics sanity (fused != dot BY DESIGN; max rel should be ~1e-3, NOT ~1e+0):\n");
+    cmp_path("t4-t3  D256", snapT1, snapT6);
+    cmp_path("t4-t4  D256", snapT1, snapT7);   // note: different V, only K-side change expected
+    cmp_path("t5-t3  D256", snapT1, snapT8);
+    cmp_path("t4q-t4 D256", snapT1, snapT9);
+    cmp_path("t4-t3  D128", snapC1, snapC2);
+    cmp_path("t4q-t4 D128", snapC3, snapC4);
 
     return 0;
 }

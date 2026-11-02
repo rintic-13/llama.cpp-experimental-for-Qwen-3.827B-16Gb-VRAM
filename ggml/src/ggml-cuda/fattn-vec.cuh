@@ -38,6 +38,156 @@ static bool ggml_cuda_fattn_vec_kq_mma_f16_enabled() {
     return val;
 }
 
+// S2 (2026-11-02): the same fused f16-MMA KQ^T machinery for the TURBO K types (TURBO4_0 /
+// TURBO5_0 / TURBO4Q_0).  K stays in the raw turbo cache bytes (mux centroid decode + dither +
+// norm folded into the f16 A fragments), Q is the same unquantized f32->f16 B fragment set.
+// Unlike nvfp4 the turbo numerics change vs the q8_1 dot path (f16 rounding of K*norm and Q),
+// so the compile default is OFF until the PPL gate passes; env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=1
+// turns it on for probing (0 forces the q8_1 dot path if the default flips).
+#ifndef GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT
+#define GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT 0
+#endif
+static bool ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled() {
+    static const bool val = [] (const char * v) {
+        if (v != nullptr) return v[0] != '0' && v[0] != '\0';
+        return GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT != 0;
+    }(getenv("GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16"));
+    return val;
+}
+
+// Fused turbo KQ: build the four f16x2 A-fragment words of one m16n8k16 tile for a pair of K
+// token rows (one 16-coord k-fragment f, lane sub-column tg).  Fragment word order matches the
+// mma operand order below: {row0:e0, row1:e0, row0:e1, row1:e1} where e0/e1 cover coord pairs
+// (2tg, 2tg+1) and (8+2tg, 9+2tg) of the 16-coord chunk cc = f & 7 inside the 128-coord turbo
+// block kb = f >> 3 (QK_TURBO* = 128 = 8 chunks per block).  Value arithmetic mirrors
+// turboN_dequant_element*() in turbo-quant.cuh bit-for-bit ((c - u)*norm etc.), so the fragment
+// equals __float2half_rn(reference f32 value).  This function is the single source of truth for
+// the coord->byte mapping and is verified coordinate-by-coordinate against the element
+// reference by tools/fa_turbo_frag_probe.cu (the NVFP4_FA_RESEARCH.md SS10j mapping-bug class).
+template <ggml_type type_K>
+static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag(
+        const char * __restrict__ Kb0, const char * __restrict__ Kb1,
+        const int f, const int tg, const uint32_t seed0, const uint32_t seed1,
+        uint32_t A[4]) {
+    static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0 || type_K == GGML_TYPE_TURBO4Q_0,
+                  "turbo kq_afrag: unsupported type_K");
+
+    const int cc = f & 7;   // 16-coord chunk inside the 128-coord block
+
+    if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+        const block_turbo4_0 * b0 = (const block_turbo4_0 *) Kb0;
+        const block_turbo4_0 * b1 = (const block_turbo4_0 *) Kb1;
+
+        const float n0 = __half2float(b0->norm);
+        const float n1 = __half2float(b1->norm);
+
+        // Nibble packing: byte j/2 holds coords (j, j+1) low/high (j even) -> e0 byte 8cc+tg,
+        // e1 byte 8cc+4+tg (coords +8).  Dither word w = j/4: w0 = 4cc + (tg>>1), w1 = w0+2,
+        // lane j%4 = 2*(tg&1) (see the dither contract in ggml-common.h).
+        const uint8_t q00 = b0->qs[8*cc + tg + 0];
+        const uint8_t q01 = b0->qs[8*cc + tg + 4];
+        const uint8_t q10 = b1->qs[8*cc + tg + 0];
+        const uint8_t q11 = b1->qs[8*cc + tg + 4];
+
+        float du0[4] = {0,0,0,0}, du1[4] = {0,0,0,0}, dv0[4] = {0,0,0,0}, dv1[4] = {0,0,0,0};
+#ifdef GGML_TURBO_DITHER
+        turbo_dither4(seed0, 4*cc + (tg >> 1) + 0, TURBO_DITHER_STEP_4BIT, du0);
+        turbo_dither4(seed0, 4*cc + (tg >> 1) + 2, TURBO_DITHER_STEP_4BIT, du1);
+        turbo_dither4(seed1, 4*cc + (tg >> 1) + 0, TURBO_DITHER_STEP_4BIT, dv0);
+        turbo_dither4(seed1, 4*cc + (tg >> 1) + 2, TURBO_DITHER_STEP_4BIT, dv1);
+#endif
+        const int kl = 2 * (tg & 1);
+
+        const half2 h00 = __floats2half2_rn((turbo4_centroid(q00 & 0xF) - du0[kl    ]) * n0,
+                                            (turbo4_centroid(q00 >>  4) - du0[kl + 1]) * n0);
+        const half2 h01 = __floats2half2_rn((turbo4_centroid(q01 & 0xF) - du1[kl    ]) * n0,
+                                            (turbo4_centroid(q01 >>  4) - du1[kl + 1]) * n0);
+        const half2 h10 = __floats2half2_rn((turbo4_centroid(q10 & 0xF) - dv0[kl    ]) * n1,
+                                            (turbo4_centroid(q10 >>  4) - dv0[kl + 1]) * n1);
+        const half2 h11 = __floats2half2_rn((turbo4_centroid(q11 & 0xF) - dv1[kl    ]) * n1,
+                                            (turbo4_centroid(q11 >>  4) - dv1[kl + 1]) * n1);
+
+        A[0] = *(const uint32_t *) &h00;
+        A[1] = *(const uint32_t *) &h10;
+        A[2] = *(const uint32_t *) &h01;
+        A[3] = *(const uint32_t *) &h11;
+    } else if constexpr (type_K == GGML_TYPE_TURBO5_0) {
+        const block_turbo5_0 * b0 = (const block_turbo5_0 *) Kb0;
+        const block_turbo5_0 * b1 = (const block_turbo5_0 *) Kb1;
+
+        const float n0 = __half2float(b0->norm);
+        const float n1 = __half2float(b1->norm);
+
+        // 5-bit index: lo nibble like turbo4 + hi bit in signs[j/8] bit j%8.  For e0 (j=16cc+2tg,
+        // +1) that is signs byte 2cc bits 2tg,2tg+1; e1 uses byte 2cc+1 at the same bit positions.
+        // No dither in the turbo5 codec (vec_dot_fattn_vec_KQ_turbo5_0 has no u term).
+        const uint8_t q00 = b0->qs[8*cc + tg + 0];
+        const uint8_t q01 = b0->qs[8*cc + tg + 4];
+        const uint8_t q10 = b1->qs[8*cc + tg + 0];
+        const uint8_t q11 = b1->qs[8*cc + tg + 4];
+
+        const uint8_t s00 = b0->signs[2*cc + 0];
+        const uint8_t s01 = b0->signs[2*cc + 1];
+        const uint8_t s10 = b1->signs[2*cc + 0];
+        const uint8_t s11 = b1->signs[2*cc + 1];
+
+        const half2 h00 = __floats2half2_rn(turbo5_centroid((q00 & 0xF) | (((s00 >> (2*tg    )) & 1) << 4)) * n0,
+                                            turbo5_centroid((q00 >>  4) | (((s00 >> (2*tg + 1)) & 1) << 4)) * n0);
+        const half2 h01 = __floats2half2_rn(turbo5_centroid((q01 & 0xF) | (((s01 >> (2*tg    )) & 1) << 4)) * n0,
+                                            turbo5_centroid((q01 >>  4) | (((s01 >> (2*tg + 1)) & 1) << 4)) * n0);
+        const half2 h10 = __floats2half2_rn(turbo5_centroid((q10 & 0xF) | (((s10 >> (2*tg    )) & 1) << 4)) * n1,
+                                            turbo5_centroid((q10 >>  4) | (((s10 >> (2*tg + 1)) & 1) << 4)) * n1);
+        const half2 h11 = __floats2half2_rn(turbo5_centroid((q11 & 0xF) | (((s11 >> (2*tg    )) & 1) << 4)) * n1,
+                                            turbo5_centroid((q11 >>  4) | (((s11 >> (2*tg + 1)) & 1) << 4)) * n1);
+
+        A[0] = *(const uint32_t *) &h00;
+        A[1] = *(const uint32_t *) &h10;
+        A[2] = *(const uint32_t *) &h01;
+        A[3] = *(const uint32_t *) &h11;
+    } else {
+        const block_turbo4q_0 * b0 = (const block_turbo4q_0 *) Kb0;
+        const block_turbo4q_0 * b1 = (const block_turbo4q_0 *) Kb1;
+
+        const float n0   = __half2float(b0->norm);
+        const float n1   = __half2float(b1->norm);
+        const float qj0  = TURBO_QJL_ALPHA * __half2float(b0->rnorm);
+        const float qj1  = TURBO_QJL_ALPHA * __half2float(b1->rnorm);
+
+        // 3-bit index like turbo3_0: lo2 in qs byte j/4 at bits (j%4)*2, hi1 bit; qjl sign in its
+        // own bit array.  For the coord pair (16cc+2tg, +1): qs byte 4cc + (tg>>1) bits 4*(tg&1)
+        // (coord+1 is the adjacent 2-bit field), hi1/signs byte 2cc(+1) bits 2tg(+1).
+        const uint8_t qq0 = b0->qs[4*cc + (tg >> 1) + 0];
+        const uint8_t qq1 = b0->qs[4*cc + (tg >> 1) + 2];
+        const uint8_t qq2 = b1->qs[4*cc + (tg >> 1) + 0];
+        const uint8_t qq3 = b1->qs[4*cc + (tg >> 1) + 2];
+
+        const uint8_t h00 = b0->hi1[2*cc + 0], g00 = b0->signs[2*cc + 0];
+        const uint8_t h01 = b0->hi1[2*cc + 1], g01 = b0->signs[2*cc + 1];
+        const uint8_t h10 = b1->hi1[2*cc + 0], g10 = b1->signs[2*cc + 0];
+        const uint8_t h11 = b1->hi1[2*cc + 1], g11 = b1->signs[2*cc + 1];
+
+        const int sh = 4 * (tg & 1);
+
+        const half2 t00 = __floats2half2_rn(
+            (turbo3_centroid(((qq0 >>  sh      ) & 0x3) | (((h00 >> (2*tg    )) & 1) << 2)) + (((g00 >> (2*tg    )) & 1) ? qj0 : -qj0)) * n0,
+            (turbo3_centroid(((qq0 >> (sh + 2) ) & 0x3) | (((h00 >> (2*tg + 1)) & 1) << 2)) + (((g00 >> (2*tg + 1)) & 1) ? qj0 : -qj0)) * n0);
+        const half2 t01 = __floats2half2_rn(
+            (turbo3_centroid(((qq1 >>  sh      ) & 0x3) | (((h01 >> (2*tg    )) & 1) << 2)) + (((g01 >> (2*tg    )) & 1) ? qj0 : -qj0)) * n0,
+            (turbo3_centroid(((qq1 >> (sh + 2) ) & 0x3) | (((h01 >> (2*tg + 1)) & 1) << 2)) + (((g01 >> (2*tg + 1)) & 1) ? qj0 : -qj0)) * n0);
+        const half2 t10 = __floats2half2_rn(
+            (turbo3_centroid(((qq2 >>  sh      ) & 0x3) | (((h10 >> (2*tg    )) & 1) << 2)) + (((g10 >> (2*tg    )) & 1) ? qj1 : -qj1)) * n1,
+            (turbo3_centroid(((qq2 >> (sh + 2) ) & 0x3) | (((h10 >> (2*tg + 1)) & 1) << 2)) + (((g10 >> (2*tg + 1)) & 1) ? qj1 : -qj1)) * n1);
+        const half2 t11 = __floats2half2_rn(
+            (turbo3_centroid(((qq3 >>  sh      ) & 0x3) | (((h11 >> (2*tg    )) & 1) << 2)) + (((g11 >> (2*tg    )) & 1) ? qj1 : -qj1)) * n1,
+            (turbo3_centroid(((qq3 >> (sh + 2) ) & 0x3) | (((h11 >> (2*tg + 1)) & 1) << 2)) + (((g11 >> (2*tg + 1)) & 1) ? qj1 : -qj1)) * n1);
+
+        A[0] = *(const uint32_t *) &t00;
+        A[1] = *(const uint32_t *) &t10;
+        A[2] = *(const uint32_t *) &t01;
+        A[3] = *(const uint32_t *) &t11;
+    }
+}
+
 // UE4M3 encode matching ggml_fp32_to_ue4m3 (used to requantize Q rows for the FP4 mma).
 static __device__ __forceinline__ uint8_t ggml_cuda_ue4m3_from_fp32(float x) {
     if (!(x > 0.0f)) return 0;
@@ -505,12 +655,13 @@ static __global__ void flash_attn_ext_vec(
             }
         } else {
             if constexpr (KQ_f16dq) {
-                // Fused NVFP4 decode + dense f16 MMA, fully register-resident (v2; NVFP4_FA_RESEARCH.md
-                // SS10e).  No smem tiles / warp syncs: the m16n8k16 fragment map is lane-aligned - lane
-                // (g, tg) owns token rows g and g+8 at coords {2tg,2tg+1, 8+2tg, 9+2tg} of each 16-coord
-                // nvfp4 subblock (= exactly one k-fragment), and query column g in the B operand.  So the
-                // A fragments are decoded straight from the two gmem words of that subblock (byte-permuted
-                // nibbles x UE4M3 scale) and the B fragments (Q) are constant over the whole CTA run.
+                // Fused decode + dense f16 MMA, fully register-resident (v2; NVFP4_FA_RESEARCH.md
+                // SS10e, turbo port SS12).  No smem tiles / warp syncs: the m16n8k16 fragment map is
+                // lane-aligned - lane (g, tg) owns token rows g and g+8 at coords {2tg,2tg+1,
+                // 8+2tg, 9+2tg} of each 16-coord k-fragment, and query column g in the B operand.
+                // The A fragments come from the raw gmem cache bytes (nvfp4: byte-permuted nibbles x
+                // UE4M3 scale; turbo: ggml_cuda_fattn_turbo_kq_afrag mux decode + dither + norm),
+                // and the B fragments (Q) are constant over the whole CTA run.
                 const int tok0 = WARP_SIZE*threadIdx.y;
                 const int g  = threadIdx.x >> 2;
                 const int tg = threadIdx.x &  3;
@@ -531,6 +682,8 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 const size_t   koff = (size_t) (tok0 + g)*nb11;
+
+                if constexpr (type_K == GGML_TYPE_NVFP4) {
                 const uint32_t sq   = (2*tg) | ((2*tg + 1) << 4); // byte_perm picks subblock bytes 2tg, 2tg+1
 
 #pragma unroll
@@ -584,6 +737,47 @@ static __global__ void flash_attn_ext_vec(
                         if (j < ncols) {
                             F4_raw[j*nthreads + tok0 + 16*mt + g + 0] = Dt[0 + e]*scale;
                             F4_raw[j*nthreads + tok0 + 16*mt + g + 8] = Dt[2 + e]*scale;
+                        }
+                    }
+                }
+                } else {
+                    // Fused TURBO decode + dense f16 MMA (S2; NVFP4_FA_RESEARCH.md SS12).  Same lane
+                    // map as the nvfp4 branch above; the K side is ggml_cuda_fattn_turbo_kq_afrag
+                    // (mux centroid decode + dither + norm folded into the f16 fragment words), so
+                    // the only per-lane work here is the block pointer walk and one mma per fragment.
+                    static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0 ||
+                                  type_K == GGML_TYPE_TURBO4Q_0, "KQ_f16dq: unexpected fused type_K");
+
+#pragma unroll
+                    for (int mt = 0; mt < 2; ++mt) {
+                        float Dt[4] = { 0.f, 0.f, 0.f, 0.f };
+#pragma unroll
+                        for (int f = 0; f < D/16; ++f) {
+                            const char * Kb0 = K + koff + (size_t) (16*mt + 0)*nb11 + (size_t) (f >> 3) * (size_t) k_blk_bytes;
+                            const char * Kb1 = K + koff + (size_t) (16*mt + 8)*nb11 + (size_t) (f >> 3) * (size_t) k_blk_bytes;
+
+                            // Dither seeds must match the vec_dot / set_rows contract: the LINEAR
+                            // block index of this row inside the cache tensor + the block-within-row
+                            // index (f>>3, QK_TURBO = 128 coords = 8 k-fragments).
+                            const uint32_t seed0 = (uint32_t) (k_tile_ibase + (int64_t) (16*mt + g + 0)*k_blk_per_row + (f >> 3));
+                            const uint32_t seed1 = (uint32_t) (k_tile_ibase + (int64_t) (16*mt + g + 8)*k_blk_per_row + (f >> 3));
+
+                            uint32_t A[4];
+                            ggml_cuda_fattn_turbo_kq_afrag<type_K>(Kb0, Kb1, f, tg, seed0, seed1, A);
+
+                            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                         : "+f"(Dt[0]), "+f"(Dt[1]), "+f"(Dt[2]), "+f"(Dt[3])
+                                         : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+                                           "r"(Bfr[f][0]), "r"(Bfr[f][1]));
+                        }
+#pragma unroll
+                        for (int e = 0; e < 2; ++e) {
+                            const int j = 2*tg + e;
+                            if (j < ncols) {
+                                F4_raw[j*nthreads + tok0 + 16*mt + g + 0] = Dt[0 + e]*scale;
+                                F4_raw[j*nthreads + tok0 + 16*mt + g + 8] = Dt[2 + e]*scale;
+                            }
                         }
                     }
                 }
@@ -923,7 +1117,10 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
     if constexpr (kq_f16_build) {
-        if (turing_mma_available(cc) && ggml_cuda_fattn_vec_kq_mma_f16_enabled()) {
+        const bool kq_f16_sel = (type_K == GGML_TYPE_NVFP4)
+            ? ggml_cuda_fattn_vec_kq_mma_f16_enabled()
+            : ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled();
+        if (turing_mma_available(cc) && kq_f16_sel) {
             fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, false, true>;
             launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
             return;
@@ -950,8 +1147,12 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
     // the mma KQ variant needs whole 64-coord k-fragments and 16-token m-tiles
     constexpr bool kq_mma_build  = (type_K == GGML_TYPE_NVFP4) && (D >= 128);
-    // fused f16 KQ needs whole 16-coord k-fragments; probe-validated at D=128/256
-    constexpr bool kq_f16_build  = (type_K == GGML_TYPE_NVFP4) && (D == 128 || D == 256);
+    // fused f16 KQ needs whole 16-coord k-fragments; probe-validated at D=128/256.
+    // Turbo K (S2): QK_TURBO* = 128 coords per block = 8 fragments, so the same D gate applies
+    // (no D=64 turbo-K instances exist).  Runtime default: nvfp4 ON, turbo OFF (SS12 PPL gate).
+    constexpr bool kq_f16_build  = (D == 128 || D == 256) &&
+        (type_K == GGML_TYPE_NVFP4 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0 ||
+         type_K == GGML_TYPE_TURBO4Q_0);
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;

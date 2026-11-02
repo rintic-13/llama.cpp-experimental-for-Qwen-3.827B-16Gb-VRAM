@@ -979,6 +979,48 @@ bodies; dequantize_V_* and dequantize_turbo*_0 entries pick the helpers up autom
 MMA_F16 prefill path benefits too). set-rows.cu / TURBO_MID_* quantizer tables intentionally
 untouched (write path, not hot).
 
+## §12 S2: fused decode + f16 m16n8k16 MMA KQ for turbo K (2026-11-02, status: implemented, gates PENDING)
+
+Port of the §10e-10i fused recipe to the turbo K types (TURBO4_0/TURBO5_0/TURBO4Q_0), inside the
+same KQ_f16dq block of flash_attn_ext_vec. Numerics deliberately change (like nvfp4 fused): K is
+f16-rounded once at fragment build and Q is exact f32->f16 (replacing q8_1 Q quantization), so the
+gate is PPL, not bitwise dump.
+
+Fragment map (validated against §10j's mispairing lesson):
+- m16n8k16, m = 16 K-token rows, n = up to 8 Q columns, k = 16 coords. Lane (g, tg) owns rows
+  g, g+8 at coords {2tg,2tg+1} (e0 frag) and {8+2tg,9+2tg} (e1 frag) of 16-coord chunk cc = f & 7
+  of turbo block kb = f >> 3 (QK_TURBO = 128 = 8 chunks; DIFFERENT from nvfp4's f >> 2 = 32-coord
+  subblocks - the single most dangerous constant in this port).
+- turbo4/5 nibble packing = CONSECUTIVE coords: byte b holds (2b, 2b+1) as (low, high) nibbles,
+  so the lane's e0/e1 fragments are just qs bytes 8cc+tg and 8cc+4+tg (nvfp4's (b, b+8) byte_perm
+  map does NOT apply). turbo5 hi bit: signs byte 2cc(+1), bits 2tg(+1). turbo4q: 2-bit lo at qs
+  byte 4cc+(tg>>1) bits 4*(tg&1), hi1/signs like turbo5; value = (C3[idx] +/- ALPHA*rnorm)*norm.
+- Dither (turbo4 only; turbo5/4q have no u term - mirrors vec_dot bodies): group w = j/4 exactly
+  as the dot path: w = 4cc + (tg>>1) (e0), +2 (e1); lane = 2*(tg&1). Seeds = linear block index
+  (k_tile_ibase + row*k_blk_per_row + kb), same contract as set_rows/convert. 4x fewer hashes
+  than the element path and ~16x fewer than the S1 vec_dot path per lane-tile.
+- Values are computed in f32 mirroring turbo{4,5,4q}_dequant_element*() op-for-op, then rounded
+  ONCE to f16 (__floats2half2_rn); the whole builder ggml_cuda_fattn_turbo_kq_afrag<type_K>() is
+  the single source of truth used by the kernel - the probe compares it end-to-end against the
+  dot path (fa_turbo_ab_probe rows T6-T9 @D=256, C2/C4 @D=128 max-rel report, expectation ~1e-3
+  not ~1e+0; a mapping bug would blow up to order-1 scores).
+- scale stays applied on the f32 score writeback (like nvfp4), mask/softcap downstream unchanged.
+
+Dispatch: kq_f16_build compile gate extended to the 3 turbo K types (D=128/256 only); runtime
+selector split: nvfp4 -> GGML_CUDA_FATTN_VEC_KQ_MMA_F16 (default ON, frozen phase), turbo ->
+GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16 with cmake default OFF (GGML_CUDA_FATTN_TURBO_KQ_MMA_F16)
+until the gate below passes; 0 always falls back to the S1 q8_1-dot vec kernel.
+
+Gate plan (user runs, GPU idle per policy):
+1. fa_turbo_ab_probe (NEW exe): T1-T5 bitwise dump rows must stay identical to dump_old (dot path
+   untouched); T6-T9 med timings vs T1/T3/T4/T5 = S2 speed; C1..C4 D=128 rows print fused-vs-dot
+   max-rel (expect ~1e-3, NOT order 1 - that is the mapping-bug alarm).
+2. ppl_quick_turbo.cmd: T5 vs T2 (turbo4-t3 NATIVE vec, fused on/off) and T7 vs T6 (turbo4q) -
+   |dPPL| <= 0.05 like the nvfp4 fused gate (nvfp4 moved +0.0318 = 7.1289->7.1607 precedent);
+   then llama-bench tg/pp A/B at the production routing (see §11 gate note: turbo4 combos are
+   currently routed to f16-scratch, routing re-measure R1-R6 runs first).
+3. If both pass: flip GGML_CUDA_FATTN_TURBO_KQ_MMA_F16 default ON + record numbers here.
+
 ## Reproduce
 
 ```

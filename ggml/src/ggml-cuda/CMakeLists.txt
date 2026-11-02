@@ -162,6 +162,15 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_FATTN_VEC_KQ_MMA_F16_DEFAULT=0)
     endif()
 
+    # S2: same fused f16-MMA KQ^T for the turbo K types (TURBO4/5/4Q). Compile default OFF until
+    # the SS12 PPL gate passes (NVFP4_FA_RESEARCH.md); env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=0/1
+    # overrides at runtime (0 = q8_1 dot fallback for A/B and debugging).
+    if (GGML_CUDA_FATTN_TURBO_KQ_MMA_F16)
+        add_compile_definitions(GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT=1)
+    else()
+        add_compile_definitions(GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT=0)
+    endif()
+
     if (GGML_CUDA_NO_PEER_COPY)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
