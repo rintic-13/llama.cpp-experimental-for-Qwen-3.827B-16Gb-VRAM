@@ -1214,6 +1214,40 @@ FASTER than dot and the per-type selector exclusion would go away. Order of veri
 show STACK:0 first, then fa_turbo_ab_new T6/C2 rows, then the PPL rows - all compared against
 FA_TURBO_BASELINE_20261103.md.
 
+### §12 S2c implemented + register-budget probe built (2026-11-03, GPU measurement PENDING)
+
+S2c, as planned: `turbo_dither4_pair(block_idx, w, hi, step)` added in ggml-common.h returns the two
+needed samples as a `float2` (v1 branch maps to j=4w+2hi+0/1, so the contract `u(block_idx,j)` is kept);
+the TURBO4_0 branch of the afrag builder now holds them in scalars and selects the half with `hi = tg & 1`.
+Since the pair always comes from ONE of the two wide products, the builder now pays a single 64x32
+multiply per group instead of two (`hi ? 668265263u : 3266489917u`).
+
+Register-budget knob added at the same time: `GGML_CUDA_FATTN_VEC_MIN_BLOCKS` (default 1 = today's
+behavior) feeds `__launch_bounds__(128, MIN_BLOCKS)`.
+
+Compile-level verification (done; no GPU needed):
+- `fa_turbo_frag_probe.exe`: `turbo4(a)=0 turbo4(b-norms)=0 turbo5=0` -> S2c is bitwise identical to the
+  pre-S2c fragment builder (which was itself 0/192 against the element reference), so dither VALUES are
+  unchanged and no PPL re-baseline is implied.
+- `cuobjdump -res-usage` on fa_turbo_ab_new.exe: STACK is 0 in ALL 9 instantiations (was 64 B in the three
+  TURBO4_0 fused ones). LOCAL:0 everywhere.
+- `cuobjdump -sass -fun` static counts (before -> after S2c):
+  * T1 t4-t3 dot: 12488 -> 12488, LDL/STL 0 -> 0, IMAD.WIDE 406 -> 406 (dot path untouched, as intended)
+  * T6 t4-t3 FUSED: 13688 -> **12152** (-11.2%), LDL/STL **256 -> 0**, IMAD.WIDE **477 -> 349** (-27%)
+  * T4 t5-t3 dot: 14448 -> 14448 (untouched); T8 t5-t3 FUSED: 13208 -> 13208 (no dither, no change)
+- MIN_BLOCKS=3 probe (fa_turbo_ab_mb3.exe): REG 255 -> **168** in every instantiation, STACK still **0**,
+  i.e. the kernel genuinely fits in 168 registers (cap for 3 blocks/SM is 170) and ptxas needed no spills
+  to do it. Occupancy would become 3 blocks/SM = 12 warps instead of 8 (+50 % latency hiding). Since
+  neither config spills, this is now a pure occupancy-vs-ILP question answerable only by timing.
+
+BLOCKED ON GPU: `strata.exe` (PID 4776) holds 15 638 MiB at 91 % util, 413 MiB free - no run started
+(VRAM policy: never touch foreign processes). Run `run_s2c_gate.cmd` when the GPU is idle: it prints the
+bitwise gate, the MIN_BLOCKS=1 timings (compare with baseline §1: T1 1.412 / T3 1.445 / T4 1.697 | T6 1.925
+/ T7 1.964 / T8 1.503 | C1 0.503 / C2 0.855) and the MIN_BLOCKS=3 timings.
+Decision tree: if t4 fused <= dot after S2c (target ~1.29/0.47), drop the TURBO4_0 exclusion in
+kq_f16_sel + rebuild the DLL + re-run the PPL rows; for MIN_BLOCKS, adopt 3 only if it wins on BOTH the
+dot and fused rows (it changes every vec instantiation in production, dot included).
+
 ## Reproduce
 
 ```

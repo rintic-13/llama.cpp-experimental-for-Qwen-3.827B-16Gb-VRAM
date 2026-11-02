@@ -602,6 +602,27 @@ GGML_TURBO_INLINE float turbo_dither(uint32_t block_idx, int j, float step) {
     return u[j & 3];
 }
 #endif // GGML_TURBO_DITHER_V1
+
+// HOT-PATH view of the same stream: the PAIR of samples (lane 2*hi, lane 2*hi+1) of one group, returned
+// as scalars instead of written through an out-param float[4]. The fused FA vec builder needs exactly
+// this pair (its kl is 2*(tg & 1), so it is only ever 0 or 2); the array form took its address and was
+// indexed by a RUNTIME lane-derived value, which forced ptxas to keep the whole 4-float group in local
+// memory: STACK:64 B/thread + 256 LDL/STL in the TURBO4_0 fused instantiations, worth +36%/+70% kernel
+// time (NVFP4_FA_RESEARCH.md SS12 spill forensics). Values are bit-identical to turbo_dither4().
+GGML_TURBO_INLINE float2 turbo_dither4_pair(uint32_t block_idx, int w, bool hi, float step) {
+#ifdef GGML_TURBO_DITHER_V1
+    const int j0 = 4*w + (hi ? 2 : 0);
+    return make_float2(turbo_dither(block_idx, j0 + 0, step), turbo_dither(block_idx, j0 + 1, step));
+#else
+    uint32_t x = block_idx * 2654435761u + (uint32_t) w * 2246822519u + 0x9E3779B9u;
+    x ^= x >> 16; x *= 2246822519u; x ^= x >> 15;
+    // hi selects which of the two wide products of turbo_dither4() the pair came from, so only one
+    // 64-bit multiply is paid per group (turbo_dither4 pays two; it produced all four lanes).
+    const uint32_t h = (uint32_t) (((uint64_t) x * (hi ? 668265263u : 3266489917u)) >> 32);
+    return make_float2(((float) (h >> 16)      * (1.0f / 65536.0f) - 0.5f) * step,
+                       ((float) (h & 0xFFFFu) * (1.0f / 65536.0f) - 0.5f) * step);
+#endif
+}
 #endif // GGML_TURBO_DITHER
 
 // 1.5625 bpw

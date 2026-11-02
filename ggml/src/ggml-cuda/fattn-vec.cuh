@@ -100,23 +100,26 @@ static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag(
         const uint8_t q10 = b1->qs[8*cc + tg + 0];
         const uint8_t q11 = b1->qs[8*cc + tg + 4];
 
-        float du0[4] = {0,0,0,0}, du1[4] = {0,0,0,0}, dv0[4] = {0,0,0,0}, dv1[4] = {0,0,0,0};
+        // Register-only dither (S2c): each lane consumes only lanes (2hi, 2hi+1) of the group, hi = tg&1.
+        // The old float[4] out-param form + runtime kl index put the groups in LOCAL MEMORY
+        // (STACK:64 B/thread, 256 LDL/STL, +36%/+70% kernel time - SS12 spill forensics).
+        const bool dhi = (tg & 1) != 0;
+        float2 du0 = make_float2(0.0f, 0.0f), du1 = du0, dv0 = du0, dv1 = du0;
 #ifdef GGML_TURBO_DITHER
-        turbo_dither4(seed0, 4*cc + (tg >> 1) + 0, TURBO_DITHER_STEP_4BIT, du0);
-        turbo_dither4(seed0, 4*cc + (tg >> 1) + 2, TURBO_DITHER_STEP_4BIT, du1);
-        turbo_dither4(seed1, 4*cc + (tg >> 1) + 0, TURBO_DITHER_STEP_4BIT, dv0);
-        turbo_dither4(seed1, 4*cc + (tg >> 1) + 2, TURBO_DITHER_STEP_4BIT, dv1);
+        du0 = turbo_dither4_pair(seed0, 4*cc + (tg >> 1) + 0, dhi, TURBO_DITHER_STEP_4BIT);
+        du1 = turbo_dither4_pair(seed0, 4*cc + (tg >> 1) + 2, dhi, TURBO_DITHER_STEP_4BIT);
+        dv0 = turbo_dither4_pair(seed1, 4*cc + (tg >> 1) + 0, dhi, TURBO_DITHER_STEP_4BIT);
+        dv1 = turbo_dither4_pair(seed1, 4*cc + (tg >> 1) + 2, dhi, TURBO_DITHER_STEP_4BIT);
 #endif
-        const int kl = 2 * (tg & 1);
 
-        const half2 h00 = __floats2half2_rn((turbo4_centroid(q00 & 0xF) - du0[kl    ]) * n0,
-                                            (turbo4_centroid(q00 >>  4) - du0[kl + 1]) * n0);
-        const half2 h01 = __floats2half2_rn((turbo4_centroid(q01 & 0xF) - du1[kl    ]) * n0,
-                                            (turbo4_centroid(q01 >>  4) - du1[kl + 1]) * n0);
-        const half2 h10 = __floats2half2_rn((turbo4_centroid(q10 & 0xF) - dv0[kl    ]) * n1,
-                                            (turbo4_centroid(q10 >>  4) - dv0[kl + 1]) * n1);
-        const half2 h11 = __floats2half2_rn((turbo4_centroid(q11 & 0xF) - dv1[kl    ]) * n1,
-                                            (turbo4_centroid(q11 >>  4) - dv1[kl + 1]) * n1);
+        const half2 h00 = __floats2half2_rn((turbo4_centroid(q00 & 0xF) - du0.x) * n0,
+                                            (turbo4_centroid(q00 >>  4) - du0.y) * n0);
+        const half2 h01 = __floats2half2_rn((turbo4_centroid(q01 & 0xF) - du1.x) * n0,
+                                            (turbo4_centroid(q01 >>  4) - du1.y) * n0);
+        const half2 h10 = __floats2half2_rn((turbo4_centroid(q10 & 0xF) - dv0.x) * n1,
+                                            (turbo4_centroid(q10 >>  4) - dv0.y) * n1);
+        const half2 h11 = __floats2half2_rn((turbo4_centroid(q11 & 0xF) - dv1.x) * n1,
+                                            (turbo4_centroid(q11 >>  4) - dv1.y) * n1);
 
         A[0] = *(const uint32_t *) &h00;
         A[1] = *(const uint32_t *) &h10;
@@ -243,8 +246,17 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
+// Register-budget knob (the analogue of Triton's BLOCK_M/N/K autotune for this kernel): minBlocks = 1
+// lets ptxas spend all 255 registers/thread, which at 128 threads/block already fills the 65536 reg/SM
+// file with 2 blocks - so any extra live state can only SPILL, never cost occupancy (SS12 forensics).
+// Raising it caps registers: 2 -> 256, 3 -> 170 (3 blocks/SM = 12 warps instead of 8, +50% latency
+// hiding). Experiments build the probe with -DGGML_CUDA_FATTN_VEC_MIN_BLOCKS=<n>.
+#ifndef GGML_CUDA_FATTN_VEC_MIN_BLOCKS
+#define GGML_CUDA_FATTN_VEC_MIN_BLOCKS 1
+#endif
+
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool KQ_mma = false, bool KQ_f16dq = false> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), GGML_CUDA_FATTN_VEC_MIN_BLOCKS)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
