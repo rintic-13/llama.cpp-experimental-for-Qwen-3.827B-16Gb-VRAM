@@ -1,8 +1,12 @@
 @echo off
 rem ppl_quick_turbo.cmd - turbo PPL baselines for the S2 gate (same -b1 -ub1 protocol as ppl_quick_20261102)
 rem Rows: production default (turbo4 combos = f16-scratch numerics) vs forced NATIVE vec (q8_1 dot, S1 kernel).
-rem S2 gate: T5 vs T2 and T7 vs T6 (same NATIVE vec path, fused f16-MMA KQ on/off) - |delta PPL| <= ~0.05
-rem like the nvfp4 fused gate; T1/T4 are the f16-scratch and f16-gold references.
+rem S2 gate (updated 2026-11-02 after the speed gate, see NVFP4_FA_RESEARCH.md SS12): fused f16-MMA KQ is
+rem selected for turbo5/turbo4q K ONLY; turbo4 K keeps dot+range-dither (fused is 35-71%% slower there).
+rem  - T7 vs T6 (turbo4q K): the real numerics gate, |delta PPL| <= ~0.05 (nvfp4 fused precedent +0.03).
+rem  - T5 vs T2 (turbo4 K): must now be EXACTLY EQUAL - the selector excludes fused for turbo4 (proves it;
+rem    set GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1 additionally to force fused for experiments).
+rem T1/T4 are the f16-scratch and f16-gold references.
 setlocal
 cd /d "G:\llama.cpp-experimental-for-Qwen-3.827B-16Gb-VRAM-main"
 set B=build-x64-windows-msvc-release\bin\llama-perplexity.exe

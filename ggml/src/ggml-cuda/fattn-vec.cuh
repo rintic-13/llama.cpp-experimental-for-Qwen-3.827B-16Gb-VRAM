@@ -44,6 +44,10 @@ static bool ggml_cuda_fattn_vec_kq_mma_f16_enabled() {
 // Unlike nvfp4 the turbo numerics change vs the q8_1 dot path (f16 rounding of K*norm and Q),
 // so the compile default is OFF until the PPL gate passes; env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=1
 // turns it on for probing (0 forces the q8_1 dot path if the default flips).
+// SPEED GATE (fa_turbo_ab_probe, idle GPU, §12): fused beats the q8_1 dot only for the dither-free
+// heavy-K decoders (turbo5 -12%, turbo4q -13%); for TURBO4_0 K the 4-lane subtractive dither makes
+// fused 35% (D256) / 71% (D128) SLOWER than the dot+range-dither path, so the runtime selector
+// excludes turbo4 unless GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1 (experiment override).
 #ifndef GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT
 #define GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT 0
 #endif
@@ -52,6 +56,10 @@ static bool ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled() {
         if (v != nullptr) return v[0] != '0' && v[0] != '\0';
         return GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT != 0;
     }(getenv("GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16"));
+    return val;
+}
+static bool ggml_cuda_fattn_vec_turbo_kq_mma_f16_force_t4() {
+    static const bool val = getenv("GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4") != nullptr;
     return val;
 }
 
@@ -1117,9 +1125,13 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
     if constexpr (kq_f16_build) {
+        // See the S2 speed gate comment at the turbo env helpers above: turbo4 K keeps the
+        // q8_1 dot + range-dither path (fused is measurably slower there); turbo5/turbo4q K
+        // follow the turbo switch.  nvfp4 keeps its own (default-ON) switch.
         const bool kq_f16_sel = (type_K == GGML_TYPE_NVFP4)
             ? ggml_cuda_fattn_vec_kq_mma_f16_enabled()
-            : ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled();
+            : (ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled() &&
+               (type_K != GGML_TYPE_TURBO4_0 || ggml_cuda_fattn_vec_turbo_kq_mma_f16_force_t4()));
         if (turing_mma_available(cc) && kq_f16_sel) {
             fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, false, true>;
             launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
