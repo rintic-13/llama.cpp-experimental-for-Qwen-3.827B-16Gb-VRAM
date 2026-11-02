@@ -184,6 +184,149 @@ static __device__ __forceinline__ uint8_t turbo_nearest_centroid_5bit(float val)
     else                               return 31;
 }
 
+// ---- Register-mux codebook decoders (S1, 2026-11-02) ----
+// The FA turbo hot path read TURBO_CENTROIDS_* one element per coordinate. The constant cache
+// broadcasts ONE address per cycle, so with divergent per-lane indices a single LDC replays up
+// to 16x: SASS forensics on the D=256 turbo4_0-turbo3_0 vec kernel showed LDC=537 (q4_1 integer
+// dot etalon: 20). All turbo codebooks are sign-symmetric with strictly monotonic magnitudes
+// (4-bit: c[idx] = +/-mag[idx&7], mag ascending; 3-bit: c = +/-mag[idx&3], mag DESCENDING in
+// idx&3 on the negative half hence the k^3 reflection; 2-bit: same pattern; 5-bit: +/-mag over
+// 16 magnitudes plus an explicit +0 at idx 16), so each value can be selected with an SEL tree
+// in registers instead. The literals below are the exact table literals and IEEE negation is an
+// exact sign-bit flip (all magnitudes nonzero), so the mux decoders return BITWISE-IDENTICAL
+// floats to the LUT reads they replace. The static_asserts check every index against a literal
+// mirror of the tables; the tools/fa_vec_ab_probe A/B additionally diffs old/new kernel output.
+// The __constant__ tables stay for the quantizer (TURBO_MID_* boundaries) and any non-hot path.
+
+static constexpr float TURBO_C2_REF[4] = {
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f
+};
+
+static constexpr float TURBO_C3_REF[8] = {
+    -0.190207f, -0.118786f, -0.066822f, -0.021663f,
+     0.021663f,  0.066822f,  0.118786f,  0.190207f
+};
+
+static constexpr float TURBO_C4_REF[16] = {
+    -0.241529f, -0.182877f, -0.143016f, -0.111036f,
+    -0.083292f, -0.058050f, -0.034299f, -0.011349f,
+     0.011349f,  0.034299f,  0.058050f,  0.083292f,
+     0.111036f,  0.143016f,  0.182877f,  0.241529f
+};
+
+static constexpr float TURBO_C5_REF[32] = {
+    -0.262203f, -0.241529f, -0.212203f, -0.182877f,
+    -0.162947f, -0.143016f, -0.127026f, -0.111036f,
+    -0.097164f, -0.083292f, -0.070671f, -0.058050f,
+    -0.046174f, -0.034299f, -0.022824f, -0.011349f,
+     0.000000f,  0.011349f,  0.022824f,  0.034299f,
+     0.046174f,  0.058050f,  0.070671f,  0.083292f,
+     0.097164f,  0.111036f,  0.127026f,  0.143016f,
+     0.162947f,  0.182877f,  0.212203f,  0.241529f
+};
+
+// Magnitude trees (explicit host+device constexpr so the static_asserts below can evaluate them
+// on the host pass and the __device__ wrappers can call them without --expt-relaxed-constexpr).
+static __host__ __device__ constexpr float turbo2_centroid_mag(const unsigned idx) {
+    const unsigned t = (idx & 1) ^ ((idx & 2) ? 0u : 1u);
+    return (t & 1) ? 0.133462f : 0.039994f;
+}
+
+static __host__ __device__ constexpr float turbo3_centroid_mag(const unsigned idx) {
+    const unsigned t = (idx & 3) ^ ((idx & 4) ? 0u : 3u);   // n[t] ascending, n0=0.021663f
+    const float e = (t & 1) ? 0.066822f : 0.021663f;
+    const float f = (t & 1) ? 0.190207f : 0.118786f;
+    return (t & 2) ? f : e;
+}
+
+static __host__ __device__ constexpr float turbo4_centroid_mag(const unsigned idx) {
+    // |c| DESCENDS with idx over the NEGATIVE half (idx 0..7), ascends over the positive half
+    // (idx 8..15): reflect idx&7 on the negative half (7-k = k^7), then the ascending tree.
+    const unsigned t = (idx & 7) ^ ((idx & 8) ? 0u : 7u);
+    const float p0 = (t & 1) ? 0.034299f : 0.011349f;
+    const float p1 = (t & 1) ? 0.083292f : 0.058050f;
+    const float p2 = (t & 1) ? 0.143016f : 0.111036f;
+    const float p3 = (t & 1) ? 0.241529f : 0.182877f;
+    const float q0 = (t & 2) ? p1 : p0;
+    const float q1 = (t & 2) ? p3 : p2;
+    return (t & 4) ? q1 : q0;
+}
+
+// 5-bit: magnitudes descend with the index on the negative half (M0=0.262203f .. M15=0.011349f);
+// the positive half reflects them (T5[17-k] = M[k]) and idx 16 is the explicit +0.
+static __host__ __device__ constexpr float turbo5_centroid_mag(const unsigned idx) {
+    const unsigned k = idx & 15;
+    const unsigned m = (idx & 16) ? 16u - k : k;            // m==16 <=> idx==16 (the +0 entry)
+    const float a = (m & 1) ? 0.241529f : 0.262203f;
+    const float b = (m & 1) ? 0.182877f : 0.212203f;
+    const float c = (m & 1) ? 0.143016f : 0.162947f;
+    const float d = (m & 1) ? 0.111036f : 0.127026f;
+    const float e = (m & 1) ? 0.083292f : 0.097164f;
+    const float f = (m & 1) ? 0.058050f : 0.070671f;
+    const float g = (m & 1) ? 0.034299f : 0.046174f;
+    const float h = (m & 1) ? 0.011349f : 0.022824f;
+    const float i0 = (m & 2) ? b : a;
+    const float i1 = (m & 2) ? d : c;
+    const float i2 = (m & 2) ? f : e;
+    const float i3 = (m & 2) ? h : g;
+    const float j0 = (m & 4) ? i1 : i0;
+    const float j1 = (m & 4) ? i3 : i2;
+    return (m == 16u) ? 0.0f : ((m & 8) ? j1 : j0);
+}
+
+static constexpr float turbo_absf_(const float x) { return x < 0.0f ? -x : x; }
+
+static constexpr bool turbo2_mux_ok(const int idx) {
+    const float ref = TURBO_C2_REF[idx];
+    const bool pos = (idx & 2) != 0;
+    return turbo2_centroid_mag((unsigned) idx) == turbo_absf_(ref) && ((ref < 0.0f) != pos);
+}
+static constexpr bool turbo2_mux_ok_all() {
+    for (int i = 0; i < 4; ++i) if (!turbo2_mux_ok(i)) return false;
+    return true;
+}
+static constexpr bool turbo3_mux_ok_all() {
+    for (int i = 0; i < 8; ++i) {
+        const float ref = TURBO_C3_REF[i];
+        if (turbo3_centroid_mag((unsigned) i) != turbo_absf_(ref)) return false;
+        if ((ref < 0.0f) != ((i & 4) == 0)) return false;   // neg half <=> hi bit clear
+    }
+    return true;
+}
+static constexpr bool turbo4_mux_ok_all() {
+    for (int i = 0; i < 16; ++i) {
+        const float ref = TURBO_C4_REF[i];
+        if (turbo4_centroid_mag((unsigned) i) != turbo_absf_(ref)) return false;
+        if ((ref < 0.0f) != ((i & 8) == 0)) return false;
+    }
+    return true;
+}
+static constexpr bool turbo5_mux_ok_all() {
+    for (int i = 0; i < 32; ++i) {
+        const float ref = TURBO_C5_REF[i];
+        if (turbo5_centroid_mag((unsigned) i) != turbo_absf_(ref)) return false;
+        if ((ref < 0.0f) != ((i & 16) == 0)) return false;
+    }
+    return true;
+}
+static_assert(turbo2_mux_ok_all(), "turbo2 mux decoder differs from TURBO_CENTROIDS_2BIT");
+static_assert(turbo3_mux_ok_all(), "turbo3 mux decoder differs from TURBO_CENTROIDS_3BIT");
+static_assert(turbo4_mux_ok_all(), "turbo4 mux decoder differs from TURBO_CENTROIDS_4BIT");
+static_assert(turbo5_mux_ok_all(), "turbo5 mux decoder differs from TURBO_CENTROIDS_5BIT");
+
+static __device__ __forceinline__ float turbo2_centroid(const unsigned idx) {
+    return __uint_as_float(__float_as_uint(turbo2_centroid_mag(idx)) ^ (((uint32_t) (idx & 2)) << 30));
+}
+static __device__ __forceinline__ float turbo3_centroid(const unsigned idx) {
+    return __uint_as_float(__float_as_uint(turbo3_centroid_mag(idx)) ^ (((uint32_t) (idx & 4)) << 29));
+}
+static __device__ __forceinline__ float turbo4_centroid(const unsigned idx) {
+    return __uint_as_float(__float_as_uint(turbo4_centroid_mag(idx)) ^ (((uint32_t) (idx & 8)) << 28));
+}
+static __device__ __forceinline__ float turbo5_centroid(const unsigned idx) {  // idx < 32
+    return __uint_as_float(__float_as_uint(turbo5_centroid_mag(idx)) ^ (((uint32_t) ((idx >> 4) ^ 1u)) << 31));
+}
+
 // ---- Inline dequant helpers: extract one float from a block (rotated domain) ----
 // The *_dithered variants are for blocks written by k_set_rows_turbo3/4 with the subtractive
 // dither: the block pointer is the block itself (row-relative indexing is the caller's business)
@@ -197,13 +340,13 @@ static __device__ __forceinline__ float turbo3_dequant_element_u(
         const block_turbo3_0 * __restrict__ blk, int j, float norm, float u) {
     const uint8_t low2 = (blk->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
     const uint8_t hi1  = (blk->signs[j / 8] >> (j % 8)) & 0x1;
-    return (TURBO_CENTROIDS_3BIT[low2 | (hi1 << 2)] - u) * norm;
+    return (turbo3_centroid(low2 | (hi1 << 2)) - u) * norm;
 }
 
 static __device__ __forceinline__ float turbo4_dequant_element_u(
         const block_turbo4_0 * __restrict__ blk, int j, float norm, float u) {
     const uint8_t idx = (blk->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
-    return (TURBO_CENTROIDS_4BIT[idx] - u) * norm;
+    return (turbo4_centroid(idx) - u) * norm;
 }
 
 static __device__ __forceinline__ float turbo3_dequant_element_dithered(
@@ -241,27 +384,27 @@ static __device__ __forceinline__ void turbo_dither_range(
 static __device__ __forceinline__ float turbo2_dequant_element(
         const block_turbo2_0 * __restrict__ x, int j, float norm) {
     const uint8_t idx = (x->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
-    return TURBO_CENTROIDS_2BIT[idx] * norm;
+    return turbo2_centroid(idx) * norm;
 }
 
 static __device__ __forceinline__ float turbo3_dequant_element(
         const block_turbo3_0 * __restrict__ x, int j, float norm) {
     const uint8_t low2 = (x->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
     const uint8_t hi1  = (x->signs[j / 8] >> (j % 8)) & 0x1;
-    return TURBO_CENTROIDS_3BIT[low2 | (hi1 << 2)] * norm;
+    return turbo3_centroid(low2 | (hi1 << 2)) * norm;
 }
 
 static __device__ __forceinline__ float turbo4_dequant_element(
         const block_turbo4_0 * __restrict__ x, int j, float norm) {
     const uint8_t idx = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
-    return TURBO_CENTROIDS_4BIT[idx] * norm;
+    return turbo4_centroid(idx) * norm;
 }
 
 static __device__ __forceinline__ float turbo5_dequant_element(
         const block_turbo5_0 * __restrict__ x, int j, float norm) {
     const uint8_t lo  = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
     const uint8_t hi  = (x->signs[j / 8] >> (j % 8)) & 0x1;
-    return TURBO_CENTROIDS_5BIT[lo | (hi << 4)] * norm;
+    return turbo5_centroid(lo | (hi << 4)) * norm;
 }
 
 // Q_prod dequant: (b-1)-bit codebook + 1-bit QJL residual sign (see ggml-common.h).
@@ -272,7 +415,7 @@ static __device__ __forceinline__ float turbo3q_dequant_element(
     const uint8_t idx  = (x->qs[j / 4] >> ((j % 4) * 2)) & 0x3;
     const uint8_t sign = (x->signs[j / 8] >> (j % 8)) & 0x1;
     const float   qjl  = (sign ? 1.0f : -1.0f) * qjl_scale;
-    return (TURBO_CENTROIDS_2BIT[idx] + qjl) * norm;
+    return (turbo2_centroid(idx) + qjl) * norm;
 }
 
 static __device__ __forceinline__ float turbo4q_dequant_element(
@@ -281,7 +424,7 @@ static __device__ __forceinline__ float turbo4q_dequant_element(
     const uint8_t hi   = (x->hi1[j / 8] >> (j % 8)) & 0x1;
     const uint8_t sign = (x->signs[j / 8] >> (j % 8)) & 0x1;
     const float   qjl  = (sign ? 1.0f : -1.0f) * qjl_scale;
-    return (TURBO_CENTROIDS_3BIT[lo | (hi << 2)] + qjl) * norm;
+    return (turbo3_centroid(lo | (hi << 2)) + qjl) * norm;
 }
 
 // ---- dequantize_block-style entry points (2 consecutive elements, like q8_0) ----

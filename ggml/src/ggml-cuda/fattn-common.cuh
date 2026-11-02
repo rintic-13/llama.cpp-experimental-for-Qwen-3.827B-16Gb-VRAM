@@ -406,10 +406,10 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
         uint16_t nib4;
         ggml_cuda_memcpy_1<sizeof(nib4)>(&nib4, K_turbo4_0[ib].qs + sizeof(nib4)*iqs4);
 
-        const float c0 = TURBO_CENTROIDS_4BIT[(nib4 >>  0) & 0xF];
-        const float c1 = TURBO_CENTROIDS_4BIT[(nib4 >>  4) & 0xF];
-        const float c2 = TURBO_CENTROIDS_4BIT[(nib4 >>  8) & 0xF];
-        const float c3 = TURBO_CENTROIDS_4BIT[(nib4 >> 12) & 0xF];
+        const float c0 = turbo4_centroid((nib4 >>  0) & 0xF);
+        const float c1 = turbo4_centroid((nib4 >>  4) & 0xF);
+        const float c2 = turbo4_centroid((nib4 >>  8) & 0xF);
+        const float c3 = turbo4_centroid((nib4 >> 12) & 0xF);
 
         const int    u    = Q_q8[k_KQ_0/nthreads];
         const int8_t * q8 = (const int8_t *) &u;
@@ -470,7 +470,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5_0(
             const int j = 4*iqs4 + l;
             const uint8_t lo  = (K_turbo5_0[ib].qs   [j / 2] >> ((j % 2) * 4)) & 0xF;
             const uint8_t hi  = (K_turbo5_0[ib].signs[j / 8] >>  (j % 8))      & 0x1;
-            c[l] = TURBO_CENTROIDS_5BIT[lo | (hi << 4)] * norm;
+            c[l] = turbo5_centroid(lo | (hi << 4)) * norm;
             sumc += c[l];
         }
 
@@ -517,7 +517,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4q_0(
             const uint8_t lo  = (K_turbo4q[ib].qs   [iq / 4] >> ((iq % 4) * 2)) & 0x3;
             const uint8_t hi  = (K_turbo4q[ib].hi1  [iq / 8] >>  (iq % 8))      & 0x1;
             const uint8_t sgn = (K_turbo4q[ib].signs[iq / 8] >>  (iq % 8))      & 0x1;
-            c[l] = norm * (TURBO_CENTROIDS_3BIT[lo | (hi << 2)] + (sgn ? qjl_scale : -qjl_scale));
+            c[l] = norm * (turbo3_centroid(lo | (hi << 2)) + (sgn ? qjl_scale : -qjl_scale));
             sumc += c[l];
         }
 

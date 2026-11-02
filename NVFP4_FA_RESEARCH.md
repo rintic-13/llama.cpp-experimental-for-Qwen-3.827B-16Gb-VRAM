@@ -901,6 +901,57 @@ passed HOST pointers as kernel output buffers (illegal access). Fixed (device ou
 unbuffered stdout); fa_nvfp4_devdiff_buggy.exe / fa_nvfp4_devdiff.exe rebuilt from the pre-10j
 (fed3fae) and fixed headers respectively.
 
+## §11 turbo4/turbo3 FA kernels: LUT-gather bottleneck + S1 register-mux decode (2026-11-02)
+
+Scope note: nvfp4 kernels are FROZEN (§10i follow-up 3); this section is the turbo KV path, the
+slowest + most economical user configs (turbo4-turbo3 / q5_1-turbo3 at -fa on).
+
+FA status first: FA is NOT the problem. All 13 turbo combos are compiled into vec-kernel
+instances (cuobjdump symbol check), and the runtime support gate accepts them. turbo3_0/turbo3q_0
+exist only as V types by design (no KQ integer dot implemented) - K=turbo3 fails FA support on
+purpose, q5_1-turbo3_0 / turbo4_0-turbo3_0 are the legal economical combos.
+
+Bottleneck (cuobjdump SASS forensics, flash_attn_ext_vec ILi256 D=256 vec kernels, pre-S1):
+
+| kernel | instr | LDC (const gather) | IDP (dp4a) | notes |
+|---|---:|---:|---:|---|
+| turbo4_0-turbo3_0 | 4096 | **537** | 0 | one __constant__ float read PER COORDINATE; divergent lanes replay each LDC up to 16x |
+| q5_1-turbo3_0 | - | high | 64 | K side integer dot OK, V side LUT |
+| nvfp4-dot (ref) | 4096 | 19 | 64 | PRMT decode (S1 idea applied to nvfp4 in §10f-h) |
+| q4_1-q4_1 (etalon) | 3872 | 20 | 64 | integer codebook |
+
+dp4a is impossible for turbo (Lloyd-Max codebook is nonlinear), so S1 = same trick as §10f-h:
+replace the gather with an SEL/FSEL mux tree over f32 immediates. All turbo codebooks are
+sign-symmetric; structure discovered during implementation (and now asserted at compile time):
+codebook entries ASCEND with idx, therefore |value| DESCENDS over the negative half:
+- 4-bit: t = (idx&7) ^ (idx&8 ? 0 : 7), ascending 8-magnitude tree, sign = XOR of bit3 into the
+  f32 sign bit (mag nonzero -> no -0 issues);
+- 3-bit: t = (idx&3) ^ (idx&4 ? 0 : 3), 4 magnitudes;
+- 2-bit:  t = (idx&1) ^ (idx&2 ? 0 : 1);
+- 5-bit: m = (idx&16) ? 16-(idx&15) : (idx&15), 16 descending magnitudes, explicit +0 at idx 16.
+IEEE negation is an exact sign-bit flip, the tree leaves are the exact table literals, so the
+mux returns BITWISE-identical floats - PPL cannot move (and the dither/QJL logic is untouched).
+
+Correctness chain (all executed, one pending GPU step):
+1. static_asserts in turbo-quant.cuh check every index of all 4 tables at compile time (this
+   caught two real bugs pre-build: sign-parity inversion in the assert loops, and the 4-bit
+   reflect polarity);
+2. host exhaustive check (temp turbo_mux_check.cu): 4+8+16+32 = 60/60 entries bitwise identical;
+3. literal diff: __constant__ tables vs the constexpr REF mirrors used by the asserts - all 4
+   arrays identical (PowerShell Compare-Object);
+4. PENDING (user GPU run): tools/fa_turbo_ab_probe.cu dumps production-kernel output per variant
+   from an OLD (pre-S1 headers, via git show) and NEW build - hashes must match per row.
+
+SASS after S1 (same kernels): turbo4_0-turbo3_0 LDC 537 -> **25**, FSEL=1823 SEL=517 (nvcc folds
+both magnitude immediates into FSEL operands), IMAD 1738, LOP3 1822, LDL/STL=0 (no spills),
+static instr count unchanged. q5_1-turbo3 LDC=25. turbo5 KQ is the heaviest mux (16 magnitudes).
+
+Touched sites (hot paths only): turbo-quant.cuh element dequants (turbo2/3/4/5 + _u dither
+variants + 3q/4q) and the 3 direct LUT reads in fattn-common.cuh vec_dot KQ turbo4/turbo5/turbo4q
+bodies; dequantize_V_* and dequantize_turbo*_0 entries pick the helpers up automatically (so the
+MMA_F16 prefill path benefits too). set-rows.cu / TURBO_MID_* quantizer tables intentionally
+untouched (write path, not hot).
+
 ## Reproduce
 
 ```
@@ -928,4 +979,9 @@ tools\fa_nvfp4_devdiff.cu   # device diff: old-LUT dot vs current dot + V-dequan
                             # via build_devdiff.cmd [outname], run standalone (~100 MB VRAM)
 cuobjdump.exe -sass -fun <mangled kernel name> build...\bin\ggml-cuda.dll   # per-kernel SASS forensics (§10i);
                             # mangled names via: cuobjdump -sass ggml-cuda.dll | findstr "Function : .*flash_attn_ext_vec"
+tools\fa_turbo_ab_probe.cu  # turbo vec-kernel A/B: production flash_attn_ext_vec timing + bitwise output dump
+                            # for T1..T5 turbo combos at nq=1/D=256/nkv=32768 (§11). Build BOTH sides with
+                            # rebuild_turbo_ab_both.cmd (header swap via git show HEAD) -> fa_turbo_ab_old/new.exe,
+                            # run each with a dump dir arg, then per-row: Get-FileHash must match, timing should drop.
+                            # nvcc flags include -DGGML_TURBO_DITHER (production dither) + sm_120a.
 ```
