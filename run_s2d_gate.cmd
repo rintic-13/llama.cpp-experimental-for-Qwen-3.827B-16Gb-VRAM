@@ -36,7 +36,8 @@ echo == 4) production A/B at d8192: fused+MB3 default vs everything OFF (old S2 
 rem Pinned expectations from the S2 close: fused ON was 27.28 t/s, dot 26.79 t/s; MB3 should widen the gap.
 echo -- P1 production default (fused ON, turbo-K D256 at 3 blocks/SM) --
 %B%\llama-bench.exe -m %M% -ngl 99 -fa on -t 7 -ub 512 -d 8192 -p 512 -n 128 -r 3 -ctk turbo4 -ctv turbo3
-echo -- P2 old behavior (dot + MB1 via forced fused OFF) --
+echo -- P2 forced-dot (TURBO_KQ_MMA_F16=0; NOTE: still at MB3 - the reg policy is compile-time, so
+echo    P1-vs-P2 isolates the FUSED effect only, not the whole S2d delta vs the baseline DLL) --
 set GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=0
 %B%\llama-bench.exe -m %M% -ngl 99 -fa on -t 7 -ub 512 -d 8192 -p 512 -n 128 -r 3 -ctk turbo4 -ctv turbo3
 set GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=

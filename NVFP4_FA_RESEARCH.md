@@ -1303,6 +1303,26 @@ does not violate the bitwise gate (frag probe 0/0/0 = dither/fragment values), b
 "dot row is bitwise" reference no longer holds for the MB3 rows - which is exactly why the final PPL
 rows must run against the final DLL (run_s2d_gate.cmd).
 
+S2d CLOSEOUT (run_s2d_gate.cmd on the final DLL, log s2d_gate_log.txt) - ALL GATES PASS, S2d ACCEPTED:
+- bitwise: turbo4(a)=0 turbo4(b-norms)=0 turbo5=0 on the final binaries.
+- probe: the step-2 pass ran while strata was live (header 15 632 MiB / 99 %; visible as max 3.3-5.4 ms
+  spikes) - the step-5 repeat ran clean and matched the idle confirmation: T1 1.099 T2 0.670 T3 1.084
+  T4 1.412 T6 1.062 T7 1.063 T8 1.205 C1 0.503 C2 0.489.
+- PPL gate: T8 fused-t4 = 7.1751 +/- 0.380, T9 forced-dot-t4 = 7.1720 +/- 0.379, same -b1 -ub1 -s42
+  protocol: dPPL(fused-dot) = +0.0031, gate |dPPL| <= 0.05. PPL is contention-immune (deterministic).
+  NOTE for future baselining: the dot row itself moved 7.1802 -> 7.1720 (-0.0082) because the MB3 policy
+  also recompiles the turbo dot kernels (hash drift above) - future turbo4 A/Bs must reference 7.1720
+  (or the fused default 7.1751), not the 2026-11-03 number.
+- production tg128 @ d8192: P1 fused 28.97 +/- 0.14 vs P2 forced-dot 28.99 +/- 0.12 (flat), pp512 206.76
+  vs 207.62. Explanation (model confirmed qwen35 27B, n_head 24 / kv 4, head_dim 256 from KV sizes
+  4.125/3.125 bpw): the -3.4% fused-vs-dot kernel win times the ~12% attention share of the d8192 decode
+  budget is ~0.4% = under bench noise; the same 12% share explains the earlier +1.8% for turbo5's -14.7%.
+  P1-vs-P2 isolates the fused effect only - both rows already carry the MB3 win vs the baseline DLL
+  (dot 1.412 -> 1.099), expected ~+3% tg vs a pre-S2d DLL build; a worktree rebuild of
+  fa-turbo-baseline-20261103 is the optional way to demonstrate it in production.
+S2d state: fused KQ enabled for turbo4+5 by default, MB3 for D256/ncol1/turbo only, prefill path
+untouched (S3 remains). S1/S2/S2c/S2d CLOSED.
+
 NOT YET MEASURED: fused-t4 PPL (at S2 close T5==T2==7.1802 EXACTLY, i.e. that run proved the exclusion,
 not fused-t4 quality). run_s2d_gate.cmd step 3 measures T8 (NATIVE, fused default) vs T9 (NATIVE, forced
 dot); gate |delta| <= 0.05 against the 7.1802 dot reference. Step 4 is the production A/B at d8192.
