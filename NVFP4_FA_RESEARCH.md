@@ -1248,6 +1248,52 @@ Decision tree: if t4 fused <= dot after S2c (target ~1.29/0.47), drop the TURBO4
 kq_f16_sel + rebuild the DLL + re-run the PPL rows; for MIN_BLOCKS, adopt 3 only if it wins on BOTH the
 dot and fused rows (it changes every vec instantiation in production, dot included).
 
+### §12 S2d: gate ran, turbo4 fused ENABLED, conditional MIN_BLOCKS policy (2026-11-03)
+
+Gate run: run_s2c_gate.cmd (fixed: the echo line's `|` needed `^|`), log s2c_gate_log.txt.
+CAVEAT recorded per VRAM policy: the script's own nvidia-smi header showed 15 762 MiB / 97 % at start
+(strata.exe had restarted after the idle snapshot) - the run should have been aborted first. Mitigating
+evidence: every byte-identical-SASS dot row reproduced the baseline within 0.2 % across BOTH reps
+(T1 1.412/1.414 vs 1.412, T3 1.447 vs 1.445, T4 1.697 vs 1.697, C1 0.503, T8 1.500 vs 1.503), which
+time-slicing contention makes impossible - so there was no contention during the kernel timings and the
+in-run A/Bs are valid. Absolute numbers of NEW configs still get re-confirmed on a provably idle GPU
+(run_s2d_gate.cmd).
+
+Timings (med ms; run1/run2 of the MIN_BLOCKS=1 probe = S2c code):
+| row | baseline | S2c r1 | S2c r2 | vs own dot |
+|---|---|---|---|---|
+| T1 dot t4t3 D256 | 1.412 | 1.412 | 1.414 | - |
+| T3 dot t4t4 | 1.445 | 1.447 | 1.447 | - |
+| T4 dot t5t3 | 1.697 | 1.697 | 1.697 | - |
+| T6 FUSED t4t3 | 1.925 | **1.369** | **1.375** | **-3.1 % vs T1** |
+| T7 FUSED t4t4 | 1.964 | **1.416** | **1.414** | **-2.2 % vs T3** |
+| T8 FUSED t5t3 | 1.503 | 1.502 | 1.500 | -11.5 % vs T4 (unchanged) |
+| C1 dot d128 | 0.503 | 0.503 | 0.503 | - |
+| C2 FUSED d128 | 0.855 | **0.491** | **0.489** | **-2.4 % vs C1** |
+
+S2c flipped the speed gate: fused t4 now WINS every row (targets were 1.29/0.47, got 1.369/0.489).
+The TURBO4_0 exclusion in kq_f16_sel is removed; the FORCE_T4 override helper is gone with it
+(GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=0 remains the runtime A/B lever).
+
+MIN_BLOCKS=3 (global probe define): -18..-25 % on EVERY D256 turbo row on both paths (T1 1.100/1.087,
+T3 1.084, T4 1.398, T6 1.065, T7 1.060, T8 1.194), but +1.0 % on q5_1-K D256 (T2 0.676 vs 0.669) and
++1.4 % on D128 dot (C1 0.510 vs 0.503). So no global adoption: new constexpr ggml_cuda_fattn_vec_min_blocks
+raises the cap to 3 blocks/SM (REG 168, STACK 0) only for turbo4/turbo5 K at D=256, everything else keeps
+today's codegen. Verified per instantiation with cuobjdump: 6x D256-turbo rows REG=168, q5_1/D128 rows
+254/255, STACK 0 everywhere. The win on dot rows whose SOURCE IS BYTE-IDENTICAL is pure occupancy
+(8 -> 12 warps/SM): the vec kernel is latency-bound, and 255 regs were ptxas greed, not need.
+POLICY REFINEMENT (from cuobjdump -res-usage of the full DLL, 352 vec instantiations): min_blocks
+additionally requires ncols==1 - the decode shape the probe actually measured. (The ncols=2 turbo D256
+rows spill 80-96 B/thread at BOTH register budgets, 255 and 168: the spill is intrinsic to the shape,
+not caused by the cap - but that shape was never timed, so it stays at min_blocks=1.) Result: the 36
+ncol=1 turbo-D256 rows sit at REG=168 (STACK 0; the two softcap t5t4 dot variants spill 8 B, a shape
+this model never calls), the 36 ncol=2 turbo-D256 rows and every non-turbo instantiation unchanged.
+
+NOT YET MEASURED: fused-t4 PPL (at S2 close T5==T2==7.1802 EXACTLY, i.e. that run proved the exclusion,
+not fused-t4 quality). run_s2d_gate.cmd step 3 measures T8 (NATIVE, fused default) vs T9 (NATIVE, forced
+dot); gate |delta| <= 0.05 against the 7.1802 dot reference. Step 4 is the production A/B at d8192.
+Bitwise dither contract is untouched since S2c (frag probe 0/0/0, re-verified in the same run).
+
 ## Reproduce
 
 ```

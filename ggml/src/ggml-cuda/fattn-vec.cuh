@@ -45,10 +45,12 @@ static bool ggml_cuda_fattn_vec_kq_mma_f16_enabled() {
 // so the compile default was OFF until the PPL gate passed; since 2026-11-03 it is ON
 // (SS12: T5==T2 exactly, dPPL(T7-T6) = -0.0052). env GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=0/1
 // overrides it at runtime (0 forces the q8_1 dot path for A/B).
-// SPEED GATE (fa_turbo_ab_probe, idle GPU, §12): fused beats the q8_1 dot only for the dither-free
-// heavy-K decoders (turbo5 -12%); for TURBO4_0 K the 4-lane subtractive dither makes fused 35%
-// (D256) / 71% (D128) SLOWER than the dot+range-dither path, so the runtime selector excludes
-// turbo4 unless GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1 (experiment override).
+// SPEED GATE (fa_turbo_ab_probe, idle GPU, §12): originally fused beat the q8_1 dot only for the
+// dither-free heavy-K decoders (turbo5 -12%); TURBO4_0 K lost 35% (D256) / 71% (D128) because the
+// float[4] dither out-params spilled to local memory. After S2c (register-only turbo_dither4_pair)
+// that is fixed: fused now BEATS the dot on every turbo4 row (D256 t4t3 1.369 vs 1.412, t4t4 1.416
+// vs 1.447; D128 0.489 vs 0.503), so the selector has no turbo4 exclusion - turbo4/turbo5 both
+// follow GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16.
 // turbo4q_0 K was retired from the FA path on 2026-11-02 (worse PPL class than the turbo4/turbo3
 // combos - the branch was buried, see §12).
 #ifndef GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT
@@ -59,10 +61,6 @@ static bool ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled() {
         if (v != nullptr) return v[0] != '0' && v[0] != '\0';
         return GGML_CUDA_FATTN_TURBO_KQ_MMA_F16_DEFAULT != 0;
     }(getenv("GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16"));
-    return val;
-}
-static bool ggml_cuda_fattn_vec_turbo_kq_mma_f16_force_t4() {
-    static const bool val = getenv("GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4") != nullptr;
     return val;
 }
 
@@ -250,13 +248,29 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 // lets ptxas spend all 255 registers/thread, which at 128 threads/block already fills the 65536 reg/SM
 // file with 2 blocks - so any extra live state can only SPILL, never cost occupancy (SS12 forensics).
 // Raising it caps registers: 2 -> 256, 3 -> 170 (3 blocks/SM = 12 warps instead of 8, +50% latency
-// hiding). Experiments build the probe with -DGGML_CUDA_FATTN_VEC_MIN_BLOCKS=<n>.
+// hiding). Experiments build the probe with -DGGML_CUDA_FATTN_VEC_MIN_BLOCKS=<n> (n>1 forces the cap
+// on every instantiation).
 #ifndef GGML_CUDA_FATTN_VEC_MIN_BLOCKS
 #define GGML_CUDA_FATTN_VEC_MIN_BLOCKS 1
 #endif
+// Production policy (S2d gate, fa_turbo_ab_probe 2026-11-03): REG 255->168 with STACK still 0 gave
+// -18..-25% on BOTH dot and fused D256 rows (T1 1.412->1.100, T6 1.369->1.065) but +1..+1.4% (worse)
+// on q5_1-K and D128-dot rows, so 3 blocks/SM is enabled only where it measured faster: turbo K at
+// D=256. Nothing else changes instantiation (nvfp4/q5_1/f16/D128 keep today's codegen).
+// UPDATE same day: the policy additionally requires ncols==1 (the decode shape the probe actually
+// measured). The ncols=2 (nq>1) turbo D256 rows spill 80-96 B/thread in cuobjdump AT BOTH register
+// budgets (255 and 168), i.e. that spill is intrinsic to the shape, not caused by the cap - but the
+// shape was never timed, so it keeps today's codegen (min_blocks=1) until someone measures it.
+template <int D, int ncols, ggml_type type_K>
+constexpr int ggml_cuda_fattn_vec_min_blocks() {
+    if (GGML_CUDA_FATTN_VEC_MIN_BLOCKS > 1) {
+        return GGML_CUDA_FATTN_VEC_MIN_BLOCKS;
+    }
+    return (D == 256 && ncols == 1 && (type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0)) ? 3 : 1;
+}
 
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool KQ_mma = false, bool KQ_f16dq = false> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), GGML_CUDA_FATTN_VEC_MIN_BLOCKS)
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), ggml_cuda_fattn_vec_min_blocks<D, ncols, type_K>())
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
@@ -1099,14 +1113,12 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
     if constexpr (kq_f16_build) {
-        // See the S2 speed gate comment at the turbo env helpers above: turbo4 K keeps the
-        // q8_1 dot + range-dither path (fused is measurably slower there); turbo5 K follows
-        // the turbo switch (turbo4q K retired from this kernel - §12).  nvfp4 keeps its own
-        // (default-ON) switch.
+        // See the S2 speed gate comment at the turbo env helpers above: after S2c fused wins both
+        // turbo4 and turbo5 rows, so the switch applies to all turbo K types (turbo4q K retired
+        // from this kernel - §12).  nvfp4 keeps its own (default-ON) switch.
         const bool kq_f16_sel = (type_K == GGML_TYPE_NVFP4)
             ? ggml_cuda_fattn_vec_kq_mma_f16_enabled()
-            : (ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled() &&
-               (type_K != GGML_TYPE_TURBO4_0 || ggml_cuda_fattn_vec_turbo_kq_mma_f16_force_t4()));
+            : ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled();
         if (turing_mma_available(cc) && kq_f16_sel) {
             fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, false, true>;
             launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);

@@ -1,12 +1,12 @@
 @echo off
 rem ppl_quick_turbo.cmd - turbo PPL baselines for the S2 gate (same -b1 -ub1 protocol as ppl_quick_20261102)
 rem Rows: production default (turbo4 combos = f16-scratch numerics) vs forced NATIVE vec (q8_1 dot, S1 kernel).
-rem S2 gate (updated 2026-11-02 after the speed gate + turbo4q retirement, NVFP4_FA_RESEARCH.md SS12): fused
-rem f16-MMA KQ is selected for turbo5 K only (turbo4 K keeps dot+range-dither, fused is 35-71%% slower;
-rem turbo4q_0 was retired from the FA path - worse PPL class, and the Oct-31 exes cannot parse its name).
+rem S2 gate (NVFP4_FA_RESEARCH.md SS12). NOTE: superseded by S2d (2026-11-03) - the selector no longer
+rem excludes turbo4 (fused won the speed gate after S2c), so below, T2 and T5 BOTH select fused now;
+rem a turbo4 DOT row needs GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16=0. Post-S2d rows are in run_s2d_gate.cmd
+rem (step 3 measures fused-t4 PPL vs the 7.1802 dot reference, gate |delta| <= 0.05).
 rem  - T7 vs T6 (turbo5 K): the real numerics gate, |delta PPL| <= ~0.05 (nvfp4 fused precedent +0.03).
-rem  - T5 vs T2 (turbo4 K): must be EXACTLY EQUAL - the selector excludes fused for turbo4 (proves it;
-rem    set GGML_CUDA_FATTN_VEC_TURBO_KQ_MMA_F16_FORCE_T4=1 additionally to force fused for experiments).
+rem  - T5 vs T2 (turbo4 K): pre-S2d proved the exclusion (exact equality); post-S2d still exact but both fused.
 rem T1/T4 are the f16-scratch and f16-gold references.
 setlocal
 cd /d "G:\llama.cpp-experimental-for-Qwen-3.827B-16Gb-VRAM-main"

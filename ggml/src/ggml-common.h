@@ -609,6 +609,9 @@ GGML_TURBO_INLINE float turbo_dither(uint32_t block_idx, int j, float step) {
 // indexed by a RUNTIME lane-derived value, which forced ptxas to keep the whole 4-float group in local
 // memory: STACK:64 B/thread + 256 LDL/STL in the TURBO4_0 fused instantiations, worth +36%/+70% kernel
 // time (NVFP4_FA_RESEARCH.md SS12 spill forensics). Values are bit-identical to turbo_dither4().
+// CUDA-only: float2/make_float2 don't exist in the MSVC host C build, and only device kernels consume
+// this view (the CPU codec and set_rows use turbo_dither()/turbo_dither4() above).
+#ifdef __CUDACC__
 GGML_TURBO_INLINE float2 turbo_dither4_pair(uint32_t block_idx, int w, bool hi, float step) {
 #ifdef GGML_TURBO_DITHER_V1
     const int j0 = 4*w + (hi ? 2 : 0);
@@ -623,6 +626,7 @@ GGML_TURBO_INLINE float2 turbo_dither4_pair(uint32_t block_idx, int w, bool hi, 
                        ((float) (h & 0xFFFFu) * (1.0f / 65536.0f) - 0.5f) * step);
 #endif
 }
+#endif // __CUDACC__
 #endif // GGML_TURBO_DITHER
 
 // 1.5625 bpw
