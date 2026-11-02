@@ -314,17 +314,25 @@ static_assert(turbo3_mux_ok_all(), "turbo3 mux decoder differs from TURBO_CENTRO
 static_assert(turbo4_mux_ok_all(), "turbo4 mux decoder differs from TURBO_CENTROIDS_4BIT");
 static_assert(turbo5_mux_ok_all(), "turbo5 mux decoder differs from TURBO_CENTROIDS_5BIT");
 
+// ONE sign-mask helper shared by the device wrappers and the host verification (the first
+// S1 probe run caught this exact bug class: the device wrapper had the sign XOR inverted for
+// the 2/3/4-bit tables - negative half is where the idx sign bit is CLEAR, tables ascend).
+// shift: signbit 2->30, 4->29, 8->28, 16->27 so the surviving bit lands on bit31.
+static __host__ __device__ constexpr uint32_t turbo_sign_mask_(const unsigned idx, const unsigned signbit, const int shift) {
+    return ((uint32_t) ((idx & signbit) ^ signbit)) << shift;
+}
+
 static __device__ __forceinline__ float turbo2_centroid(const unsigned idx) {
-    return __uint_as_float(__float_as_uint(turbo2_centroid_mag(idx)) ^ (((uint32_t) (idx & 2)) << 30));
+    return __uint_as_float(__float_as_uint(turbo2_centroid_mag(idx)) ^ turbo_sign_mask_(idx, 2u, 30));
 }
 static __device__ __forceinline__ float turbo3_centroid(const unsigned idx) {
-    return __uint_as_float(__float_as_uint(turbo3_centroid_mag(idx)) ^ (((uint32_t) (idx & 4)) << 29));
+    return __uint_as_float(__float_as_uint(turbo3_centroid_mag(idx)) ^ turbo_sign_mask_(idx, 4u, 29));
 }
 static __device__ __forceinline__ float turbo4_centroid(const unsigned idx) {
-    return __uint_as_float(__float_as_uint(turbo4_centroid_mag(idx)) ^ (((uint32_t) (idx & 8)) << 28));
+    return __uint_as_float(__float_as_uint(turbo4_centroid_mag(idx)) ^ turbo_sign_mask_(idx, 8u, 28));
 }
 static __device__ __forceinline__ float turbo5_centroid(const unsigned idx) {  // idx < 32
-    return __uint_as_float(__float_as_uint(turbo5_centroid_mag(idx)) ^ (((uint32_t) ((idx >> 4) ^ 1u)) << 31));
+    return __uint_as_float(__float_as_uint(turbo5_centroid_mag(idx)) ^ turbo_sign_mask_(idx, 16u, 27));
 }
 
 // ---- Inline dequant helpers: extract one float from a block (rotated domain) ----

@@ -939,8 +939,27 @@ Correctness chain (all executed, one pending GPU step):
 2. host exhaustive check (temp turbo_mux_check.cu): 4+8+16+32 = 60/60 entries bitwise identical;
 3. literal diff: __constant__ tables vs the constexpr REF mirrors used by the asserts - all 4
    arrays identical (PowerShell Compare-Object);
-4. PENDING (user GPU run): tools/fa_turbo_ab_probe.cu dumps production-kernel output per variant
-   from an OLD (pre-S1 headers, via git show) and NEW build - hashes must match per row.
+4. GPU dump A/B (fa_turbo_ab_probe, first run): caught a THIRD real bug class - the static
+   asserts and the host mirror verified magnitude+sign-parity, but the __device__ wrapper XORed
+   the sign for idx sign bit SET, while in these ascending tables the NEGATIVE half has the
+   sign bit CLEAR. 2/3/4-bit wrappers inverted (+0 entry kept turbo5 correct); probe symptom:
+   turbo4/turbo4q K meta and turbo3 V dst dumps differ wildly, turbo5/q5_1 K meta identical -
+   exactly the predicted split. Fixed by routing every wrapper AND the host mirror through one
+   constexpr turbo_sign_mask_ helper (single source of truth for sign polarity). The
+   bitwise dump gate must now pass on rerun - PENDING user run.
+
+GPU A/B timing result (first run, RTX 5060 Ti, nq=1/D=256/nkv=32768, med):
+
+| variant | OLD LUT | NEW mux | speedup |
+|---|---:|---:|---:|
+| T1 turbo4-turbo3 | 2.891 ms (346 t/s-eq) | 1.418 ms (705) | **2.04x** |
+| T2 q5_1-turbo3 | 1.140 | 0.679 | 1.68x |
+| T3 turbo4-turbo4 | 3.642 | 1.447 | 2.52x |
+| T4 turbo5-turbo3 | 3.778 | 1.693 | 2.23x |
+| T5 turbo4q-turbo4 | 2.888 | 1.496 | 1.93x |
+
+(Sign-inverted decode is timing-representative: same instruction mix, codebook is sign-symmetric,
+so the OLD/NEW timings above carry over; only the bitwise gate had to be rerun after the fix.)
 
 SASS after S1 (same kernels): turbo4_0-turbo3_0 LDC 537 -> **25**, FSEL=1823 SEL=517 (nvcc folds
 both magnitude immediates into FSEL operands), IMAD 1738, LOP3 1822, LDL/STL=0 (no spills),
