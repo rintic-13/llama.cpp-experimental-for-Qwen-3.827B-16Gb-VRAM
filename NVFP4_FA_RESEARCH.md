@@ -932,7 +932,7 @@ codebook entries ASCEND with idx, therefore |value| DESCENDS over the negative h
 IEEE negation is an exact sign-bit flip, the tree leaves are the exact table literals, so the
 mux returns BITWISE-identical floats - PPL cannot move (and the dither/QJL logic is untouched).
 
-Correctness chain (all executed, one pending GPU step):
+Correctness chain (all executed; GPU gate PASSED):
 1. static_asserts in turbo-quant.cuh check every index of all 4 tables at compile time (this
    caught two real bugs pre-build: sign-parity inversion in the assert loops, and the 4-bit
    reflect polarity);
@@ -945,8 +945,11 @@ Correctness chain (all executed, one pending GPU step):
    sign bit CLEAR. 2/3/4-bit wrappers inverted (+0 entry kept turbo5 correct); probe symptom:
    turbo4/turbo4q K meta and turbo3 V dst dumps differ wildly, turbo5/q5_1 K meta identical -
    exactly the predicted split. Fixed by routing every wrapper AND the host mirror through one
-   constexpr turbo_sign_mask_ helper (single source of truth for sign polarity). The
-   bitwise dump gate must now pass on rerun - PENDING user run.
+   constexpr turbo_sign_mask_ helper (single source of truth for sign polarity). Rerun after the
+   fix: **GATE PASSED** - all 5 variant dump hashes identical OLD vs NEW, and the in-app fnv
+   checksums of the NEW build equal the OLD build's to the hex digit on every variant
+   (T1 16967c5c..., T2 18050523..., T3 fc4168b0..., T4 be2c62d9..., T5 34838b75...).
+   PPL/outputs therefore cannot move.
 
 GPU A/B timing result (first run, RTX 5060 Ti, nq=1/D=256/nkv=32768, med):
 
@@ -959,7 +962,12 @@ GPU A/B timing result (first run, RTX 5060 Ti, nq=1/D=256/nkv=32768, med):
 | T5 turbo4q-turbo4 | 2.888 | 1.496 | 1.93x |
 
 (Sign-inverted decode is timing-representative: same instruction mix, codebook is sign-symmetric,
-so the OLD/NEW timings above carry over; only the bitwise gate had to be rerun after the fix.)
+so the OLD/NEW timings above carry over; the post-fix rerun reproduced them within noise and the
+bitwise dump gate passed 5/5.)
+
+Remaining gap to the q4_1 integer-dot etalon (~2.3k t/s-equiv at this shape) is instruction-mix
+bound (FFMA float dot + dither hash); the next lever would be S2 = porting the fused decode +
+f16 m16n8k16 MMA KQ recipe (§10e-10i) to turbo4/5/4q. Not scheduled; S1 closed the worst 2.5x.
 
 SASS after S1 (same kernels): turbo4_0-turbo3_0 LDC 537 -> **25**, FSEL=1823 SEL=517 (nvcc folds
 both magnitude immediates into FSEL operands), IMAD 1738, LOP3 1822, LDL/STL=0 (no spills),
