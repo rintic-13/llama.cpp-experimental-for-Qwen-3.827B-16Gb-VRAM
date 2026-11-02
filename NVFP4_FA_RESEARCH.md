@@ -848,6 +848,13 @@ ggml_cuda_fattn_vec_kq_mma_f16_enabled(); the env var stays as a pure runtime ov
 FA_QUANTS list carries the two production nvfp4 combos: nvfp4-nvfp4 (memory, 0.5625 B/c) and
 q5_1-nvfp4 (quality: integer q5_1 K dot + nvfp4 V), plus f16-nvfp4 for the bf16/f16-K path.
 
+Follow-up 3 (same day, FREEZE): nvfp4 CUDA kernels are frozen - no further code changes.
+Build verified complete: FA vec instances (nvfp4-nvfp4 x6 incl fused KQ_f16dq variant,
+q5_1-nvfp4, f16-nvfp4) + mmq-instance-nvfp4 compiled; FORCE_MMQ/FORCE_CUBLAS OFF (MMQ used
+where cuBLAS does not apply). First measurement of the quality combo q5_1-nvfp4 (user run,
+quick set, Chunks-1): PPL 7.1439, decode 32.84 t/s @4K - between nvfp4-fused 7.1607 and
+q4_1 7.1306 (gold 7.1378): q5_1-K recovers most of the score error while V stays at 0.5625 B/c.
+
 ### 10j. The 10h PRMT+dp4a dot rewrite was numerically WRONG (2026-11-02)
 
 First PPL after the 10h dot rewrite (fa_comp_20261102_015717, Chunks-4, quick set):
