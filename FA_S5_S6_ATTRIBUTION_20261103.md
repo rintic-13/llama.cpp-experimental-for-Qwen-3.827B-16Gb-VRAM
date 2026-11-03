@@ -757,8 +757,24 @@ Production state: `CEN_TAB=1`, `VTAB=4` compile by default in `fattn-vec.cuh` / 
 identical to the frozen S2d baseline (9/9 rows), PPL 7.1719 vs 7.1751 (Δ −0.0032, tolerance 0.05).
 
 Expected production effect (S2d's measured ~12 % attention share of decode): ≈ **−4.9 % decode time**,
-tg ≈ 28.97 → ~30.4.  Not benchmarked in production — the user closed the branch here; `llama-bench`
-d8192 A/B remains available if that number is ever wanted.
+tg ≈ 28.97 → ~30.4.
+
+MEASURED 2026-11-03 on the release build `d89cfff (29)` (llama-bench, idle GPU, model qwen35 27B
+IQ3_S, `-ngl 99 -fa on -ctk turbo4 -ctv turbo3 -d 8192 -p 512 -n 128 -r 3`, defaults, no env vars):
+
+| metric | frozen S2d anchor | this build | delta |
+|---|---|---|---|
+| tg128 @ d8192 | 28.97 ± 0.14 (P1 fused, NVFP4_FA_RESEARCH §S2d closeout) | **30.04 ± 0.12** | **+3.7 %** decode throughput |
+| pp512 @ d8192 | 206.76 | 936.76 ± 11.04 | NOT claimed as a delta — see caveat |
+
+The measured tg gain (+3.7 %) lands in the predicted band (~30.0–30.4, i.e. −3.5…−4.9 % decode time);
+the prediction was slightly optimistic.  Caveat for the pp row: the recorded pp512@d8192 anchors do not
+reconcile with each other (S2d 206.76, corroborated by the §S3 nsys trace at 2.48 s/chunk; FA_TURBO_
+BASELINE §4/§5 954.02 / 890.32 under the same flags), which points at a measurement-semantics
+difference in llama-bench pp runs at deep `-d` that has not been re-derived.  Today's run also omitted
+`-t 7 -ub 512` vs the frozen S2d harness.  Only the tg row is protocol-family-consistent and quotable;
+until the pp semantics are pinned down, prefill must not be quoted as changed by S7/S8 (the kernel
+level fact stands: the win is in the decode vec kernel).
 
 Deliberately NOT done: no commit (the user closed the branch without approving one).  Uncommitted at
 close: `fattn-vec.cuh`, `turbo-quant.cuh`, `fattn-common.cuh` (the S8 table plumbing and the two
