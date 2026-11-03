@@ -35,8 +35,11 @@ static bool ggml_cuda_fattn_vec_kq_mma_enabled() {
 // turbo4_centroid(), so the values - and therefore the fragments - are bit-identical.
 // Cost: +2048 B smem (6912 B total, still 3 blocks/SM), 1 __syncthreads() per launch, and 256
 // LDS.* per warp-tile instead of ~2000 ALU ops.
+// ACCEPTED 2026-11-03 (FA_S5_S6_ATTRIBUTION_20261103.md SS2f/SS2j): -21.7% instructions, T6
+// -27.4% alone / -40.8% with the V-side table, bitwise-identical in every probe hash.  ON by
+// default; GGML_CUDA_FATTN_VEC_CEN_TAB=0 still compiles the mux-tree path for A/B.
 #ifndef GGML_CUDA_FATTN_VEC_CEN_TAB
-#define GGML_CUDA_FATTN_VEC_CEN_TAB 0
+#define GGML_CUDA_FATTN_VEC_CEN_TAB 1
 #endif
 
 // Fused f16 KQ^T in the vec kernel (GGML_CUDA_FATTN_VEC_KQ_MMA_F16=1, NVFP4 K only):
@@ -576,12 +579,28 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
+    // S7: byte-indexed turbo4 centroid pairs (see the note at the top of the file).  Defined here
+    // because the V-side table form below depends on it, and used further down for the KCEN array.
+    constexpr bool cen_tab = GGML_CUDA_FATTN_VEC_CEN_TAB != 0 &&
+                             (GGML_CUDA_FATTN_VEC_COST & 2) == 0 &&
+                             KQ_f16dq && !KQ_mma && type_K == GGML_TYPE_TURBO4_0;
+
+    // §2h: which V centroid table this instantiation should use.  Where the K side is table-ised too,
+    // the K-side ALU work is gone and the 8 KB byte-value-indexed table read is no longer hidden
+    // behind it - there the 32 B broadcast table wins by 6.8 % even though it carries 11 % more
+    // instructions.  Where the K side still decodes with mux trees, the gather is free and the wide
+    // table wins by 6-9 %.  GGML_CUDA_FATTN_VEC_VTAB=3 encodes exactly that per-instantiation rule;
+    // =5 uses the same rule with the float2 form (§2i) in place of the float4 form.
+    constexpr int vtab_mode = GGML_CUDA_FATTN_VEC_VTAB == 3 ? (cen_tab ? 2 : 1)
+                          : GGML_CUDA_FATTN_VEC_VTAB == 5 ? (cen_tab ? 2 : 4)
+                                                          : GGML_CUDA_FATTN_VEC_VTAB;
+
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
     constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
+    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread, vtab_mode>();
 #else
-    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
+    constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread, vtab_mode>();
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
@@ -677,10 +696,8 @@ static __global__ void flash_attn_ext_vec(
 #endif // __CUDA_ARCH__
     }
 
-    // S7: byte-indexed turbo4 centroid pairs (see the note at the top of the file).
-    constexpr bool cen_tab = GGML_CUDA_FATTN_VEC_CEN_TAB != 0 &&
-                             (GGML_CUDA_FATTN_VEC_COST & 2) == 0 &&
-                             KQ_f16dq && !KQ_mma && type_K == GGML_TYPE_TURBO4_0;
+    // S7: byte-indexed turbo4 centroid pairs (the cen_tab condition is defined above, next to
+    // vtab_mode, because the V table form depends on it).
     __shared__ float2 KCEN[cen_tab ? 256 : 1];
     if constexpr (cen_tab) {
         for (int b = WARP_SIZE*threadIdx.y + threadIdx.x; b < 256; b += nthreads) {

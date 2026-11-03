@@ -7,6 +7,16 @@
 
 #include <cstdint>
 
+// DIAGNOSTIC ONLY (probe builds pass it with -D, never set in a production build).  Bit 4 stubs the
+// turbo3 V decode centroid/extraction to a constant, bit 8 skips the V dither group hash, and bit
+// 16 collapses the S8 table gather to two L1 lines, so their instruction / L1-wavefront cost can be
+// attributed statically with cuobjdump -sass and by timing; numerics are meaningless with any of
+// bits 4/8/16 set.  (Bits 1/2 attribute the fused turbo4 KQ walk and are handled in
+// fattn-vec.cuh, which includes this file first - hence the guard here.)
+#ifndef GGML_CUDA_FATTN_VEC_COST
+#define GGML_CUDA_FATTN_VEC_COST 0
+#endif
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -858,7 +868,7 @@ static __device__ __forceinline__ void dequantize_V_turbo5_0(const void * __rest
     }
 }
 
-template <typename T, int ne>
+template <typename T, int ne, int vtab = GGML_CUDA_FATTN_VEC_VTAB>
 static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t v_ibase) {
     const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
 
@@ -873,16 +883,102 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
     // Batched group hashes (1 per 4 coords) - FA decode hot path, see turbo_dither_range.
     const uint32_t seed = (uint32_t) (v_ibase + ib);
     float du[4];
+#if GGML_CUDA_FATTN_VEC_COST & 8
+    // DIAGNOSTIC ONLY (GGML_CUDA_FATTN_VEC_COST bit 8): skip the group hash, keep the arithmetic.
+    du[0] = du[1] = du[2] = du[3] = 0.0f;
+#else
     turbo_dither_range(seed, j0, ne, TURBO_DITHER_STEP_3BIT, du);
 #endif
+#else
+    // The S8 table path below is written in the dithered form (c - u) * norm; with the dither
+    // compiled out the same expression collapses to c * norm, so supply the identity u = 0
+    // (c - 0.0f == c bitwise, including for c == -0.0f).
+    float du[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#endif
+
+#if GGML_CUDA_FATTN_VEC_VTAB
+    // S8: byte-indexed decode of all four coords at once (see the tables in turbo-quant.cuh).
+    // Legal because every ne == 4 caller passes i0 % 4 == 0, so coords j0..j0+3 share one qs byte
+    // (four 2-bit fields) and one signs byte (four 1-bit fields at offset j0 & 4).  Every form below
+    // returns the same turbo3_centroid() values, so all of them are bitwise identical; they differ
+    // only in where the table lives and how wide its index is (measured in §2h):
+    //   vtab == 1: one 8 KB float4 table - 2 LDG.128 + 4 SEL, fewest instructions, but the index is
+    //              a byte *value*, so the two loads are gathers touching ~20 L1 lines each.
+    //   vtab == 2: 8-value scalar table (32 B = one line) - 4 LDG.32, most instructions, no gather.
+    //   vtab == 4: signed float2 pairs, 64 entries = 512 B = 4 lines - 2 LDG.64, ALU ~= vtab 1.
+    //   vtab == 3: "auto", resolved by the caller to 2 or 1 (fattn-vec picks by the K-side table);
+    //              if it reaches here unresoved it behaves as 1.
+    if constexpr (ne == 4 && vtab != 0) {
+        float c[4];
+#if GGML_CUDA_FATTN_VEC_COST & 4
+        c[0] = c[1] = c[2] = c[3] = 0.5f;   // DIAGNOSTIC: extraction + centroid removed
+#else
+        const uint32_t qb = x[ib].qs[j0 >> 2];
+        const uint32_t sb = (uint32_t) x[ib].signs[j0 >> 3] >> (j0 & 4);
+
+        if constexpr (vtab == 2) {
+            const float s0 = __ldg(&TURBO3_C8_TAB.v[(qb & 3u) | ((sb & 1u) << 2)]);
+            const float s1 = __ldg(&TURBO3_C8_TAB.v[((qb >> 2) & 3u) | (((sb >> 1) & 1u) << 2)]);
+            const float s2 = __ldg(&TURBO3_C8_TAB.v[((qb >> 4) & 3u) | (((sb >> 2) & 1u) << 2)]);
+            const float s3 = __ldg(&TURBO3_C8_TAB.v[((qb >> 6) & 3u) | (((sb >> 3) & 1u) << 2)]);
+            c[0] = s0; c[1] = s1; c[2] = s2; c[3] = s3;
+        } else if constexpr (vtab == 4) {
+            const float2 p01 = __ldg(&TURBO3_C2_TAB.v[(qb & 0x0Fu) | ((sb & 0x3u) << 4)]);
+            const float2 p23 = __ldg(&TURBO3_C2_TAB.v[((qb >> 4) & 0x0Fu) | (((sb >> 2) & 0x3u) << 4)]);
+            c[0] = p01.x; c[1] = p01.y; c[2] = p23.x; c[3] = p23.y;
+        } else {
+#if GGML_CUDA_FATTN_VEC_COST & 16
+            // DIAGNOSTIC ONLY (bit 16): collapse the table *gather*, keep everything else.  The byte
+            // load, the two LDG.128, the SEL chain and the downstream FMA walk all stay, but the
+            // effective index is restricted to two values 128 B apart, so each gather touches 2 L1
+            // lines instead of up to 32.  This is the discriminator §2h used to prove the gather is
+            // what costs the S7+S8 combination win.  The mask is one LOP3 that folds into the
+            // address computation (+2.5 % instructions).  Numerics are meaningless.
+            const uint32_t qm = qb & 0x08u;
+#else
+            const uint32_t qm = qb;
+#endif
+            const float4 cn = __ldg(&TURBO3_C4_TAB.v[qm]);
+            const float4 cp = __ldg(&TURBO3_C4_TAB.v[qm | 256u]);
+
+            c[0] = (sb & 0x1u) ? cp.x : cn.x;
+            c[1] = (sb & 0x2u) ? cp.y : cn.y;
+            c[2] = (sb & 0x4u) ? cp.z : cn.z;
+            c[3] = (sb & 0x8u) ? cp.w : cn.w;
+        }
+#endif
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, half>) {
+            ((half2 *) dst)[0] = make_half2((c[0] - du[0]) * norm, (c[1] - du[1]) * norm);
+            ((half2 *) dst)[1] = make_half2((c[2] - du[2]) * norm, (c[3] - du[3]) * norm);
+        } else
+#endif // FP16_AVAILABLE
+        if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                ((float *) dst)[l] = (c[l] - du[l]) * norm;
+            }
+        } else {
+            static_assert(std::is_same_v<T, void>, "bad type");
+        }
+        return;
+    }
+#endif // GGML_CUDA_FATTN_VEC_VTAB
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
 #ifdef GGML_TURBO_DITHER
+#if GGML_CUDA_FATTN_VEC_COST & 4
+            // DIAGNOSTIC ONLY (see GGML_CUDA_FATTN_VEC_COST bit 4): keep the dither + norm scale,
+            // drop the extraction and the centroid tree, to attribute their instruction cost.
+            ((half2 *) dst)[l0/2] = make_half2((0.5f - du[l0 + 0]) * norm,
+                                               (0.5f - du[l0 + 1]) * norm);
+#else
             ((half2 *) dst)[l0/2] = make_half2(turbo3_dequant_element_u(x + ib, j0 + l0 + 0, norm, du[l0 + 0]),
                                                turbo3_dequant_element_u(x + ib, j0 + l0 + 1, norm, du[l0 + 1]));
+#endif
 #else
             ((half2 *) dst)[l0/2] = make_half2(turbo3_dequant_element(x + ib, j0 + l0 + 0, norm),
                                                 turbo3_dequant_element(x + ib, j0 + l0 + 1, norm));
@@ -894,7 +990,14 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
 #ifdef GGML_TURBO_DITHER
+#if GGML_CUDA_FATTN_VEC_COST & 4
+            // DIAGNOSTIC ONLY (GGML_CUDA_FATTN_VEC_COST bit 4).  This is the branch the CUDA vec
+            // kernel actually takes - V_DOT2_F32_F16_AVAILABLE, which would select the half2 form,
+            // is HIP-only - so the ablation has to be here, not in the half path above.
+            ((float *) dst)[l] = (0.5f - du[l]) * norm;
+#else
             ((float *) dst)[l] = turbo3_dequant_element_u(x + ib, j0 + l, norm, du[l]);
+#endif
 #else
             ((float *) dst)[l] = turbo3_dequant_element(x + ib, j0 + l, norm);
 #endif
@@ -1159,7 +1262,7 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     }
 }
 
-template <ggml_type type_V, typename T, int ne>
+template <ggml_type type_V, typename T, int ne, int vtab = GGML_CUDA_FATTN_VEC_VTAB>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
         return dequantize_V_f16<T, ne>;
@@ -1178,7 +1281,7 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     } else if constexpr (type_V == GGML_TYPE_TURBO5_0) {
         return dequantize_V_turbo5_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
-        return dequantize_V_turbo3_0<T, ne>;
+        return dequantize_V_turbo3_0<T, ne, vtab>;
     } else if constexpr (type_V == GGML_TYPE_TURBO3Q_0) {
         return dequantize_V_turbo3q_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_NVFP4) {

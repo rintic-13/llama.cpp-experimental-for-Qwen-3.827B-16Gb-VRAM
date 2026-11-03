@@ -335,6 +335,158 @@ static __device__ __forceinline__ float turbo5_centroid(const unsigned idx) {  /
     return __uint_as_float(__float_as_uint(turbo5_centroid_mag(idx)) ^ turbo_sign_mask_(idx, 16u, 27));
 }
 
+// ---- S8: byte-indexed turbo3 decode tables for the FA V path (GGML_CUDA_FATTN_VEC_VTAB) ----
+//
+// dequantize_V_turbo3_0 is only ever instantiated with ne == 4, and every caller passes an i0 that
+// is a multiple of 4 (fattn-vec: i0 = 2*i_VKQ_0 + lane*4; lightning-indexer: lane*4 / i_embd*4).
+// Four consecutive coords therefore share ONE qs byte (four 2-bit fields) and ONE signs byte (four
+// 1-bit fields), which is what a table indexes.
+//
+// The sign is not a post-process either: turbo3_centroid_mag() itself reflects the magnitude index
+// when the sign bit is clear (t = (idx&3) ^ (idx&4 ? 0 : 3)), so the sign bit is part of the index.
+// All tables are built from turbo3_centroid_c(), so every form is bit-identical to turbo3_centroid(),
+// and each table is cross-checked against the others by a static_assert.
+//
+// GGML_CUDA_FATTN_VEC_VTAB:
+//   0 off (scalar mux decode)
+//   1 one 8 KB float4 table: fewest instructions, but value-indexed gathers (up to ~20 L1 lines/load)
+//   2 8-value scalar table (32 B = one cache line): most instructions, no gather
+//   4 signed float2 pairs, 64 entries (512 B): 2 gathers of ~4 lines, ALU ~= form 1
+//   3 per-instantiation choice made by fattn-vec: 2 where the K side uses its own table, else 1
+//   5 same rule but 4 instead of 1 where the K side has no table
+// Measured (FA_S5_S6_ATTRIBUTION_20261103.md SS2h-SS2j): form 1 wins where the K side still carries
+// its mux trees, form 2 wins where the K side is table-ised - hence 3/5.  The final pick run (SS2j)
+// then showed form 4 dominates BOTH corners - best form on every probe row, T6 -40.8% with S7,
+// bitwise - and the auto rules (3/5) cost 9.9% on the S7 rows.  ACCEPTED 2026-11-03: default 4;
+// 3/5 stay as forensics of the rejected hypothesis.
+#ifndef GGML_CUDA_FATTN_VEC_VTAB
+#define GGML_CUDA_FATTN_VEC_VTAB 4
+#endif
+
+#if GGML_CUDA_FATTN_VEC_VTAB
+// turbo3_centroid() as a constexpr: the magnitude is positive, so an exact multiply by +-1
+// reproduces the bit-31 XOR of turbo_sign_mask_() (no rounding involved).
+static __host__ __device__ constexpr float turbo3_centroid_c(const unsigned idx) {
+    return turbo3_centroid_mag(idx) * ((idx & 4u) != 0 ? 1.0f : -1.0f);
+}
+
+// GGML_CUDA_FATTN_VEC_VTAB == 1: ONE table, both halves: [0..255] is the hi1 = 0 half
+// (-0.190207 .. -0.021663), [256..511] the hi1 = 1 half (+0.021663 .. +0.190207).  A single object
+// means a single 64-bit base register in the decode and the second read is the same address plus an
+// immediate 0x1000 - two separate arrays measurably spilled (STACK:8 in the D256/turbo5-K/turbo3-V
+// dot instantiation).
+struct turbo3_c4_tab {
+    float4 v[512];   // v[(hi1<<8) | b].{x,y,z,w} = centroids of the four 2-bit fields of byte b
+    __host__ __device__ constexpr turbo3_c4_tab() : v{} {
+        for (unsigned hi1 = 0; hi1 < 2; ++hi1) {
+            for (unsigned b = 0; b < 256; ++b) {
+                float4 & e = v[(hi1 << 8) | b];
+                e.x = turbo3_centroid_c(((b >> 0) & 3u) | (hi1 << 2));
+                e.y = turbo3_centroid_c(((b >> 2) & 3u) | (hi1 << 2));
+                e.z = turbo3_centroid_c(((b >> 4) & 3u) | (hi1 << 2));
+                e.w = turbo3_centroid_c(((b >> 6) & 3u) | (hi1 << 2));
+            }
+        }
+    }
+};
+
+static __device__ constexpr turbo3_c4_tab TURBO3_C4_TAB{};
+
+// GGML_CUDA_FATTN_VEC_VTAB == 2 (S8c): the same values in the shape of the value domain.  There are
+// only 8 distinct turbo3 centroids, so this table is 32 B = one cache line, and every lane's read is
+// a broadcast out of that line instead of a gather out of 8 KB.  Costs more instructions (4 LDG.32 +
+// index math per byte instead of 2 LDG.128 + 4 SEL) and buys the L1 wavefronts back.  Built by a
+// constexpr constructor like the float4 table so the same static_assert can check it.
+struct turbo3_c8_tab {
+    float v[8];
+    __host__ __device__ constexpr turbo3_c8_tab() : v{} {
+        for (unsigned i = 0; i < 8; ++i) {
+            v[i] = turbo3_centroid_c(i);
+        }
+    }
+};
+
+static __device__ constexpr turbo3_c8_tab TURBO3_C8_TAB{};
+
+// GGML_CUDA_FATTN_VEC_VTAB == 4 (S8e): signed float2 pairs, 64 entries = 512 B = FOUR cache lines.
+// The point is that turbo3_centroid_mag() itself reflects the magnitude index when the sign bit is
+// clear (t = (idx&3) ^ (idx&4 ? 0 : 3)), so the sign is part of the *index*, not a post-process -
+// which lets two coords share one 6-bit index (4 magnitude bits + 2 sign bits).  Two LDG.64 per byte
+// with roughly the same ALU as the float4 form, at ~4 touched lines per gather instead of ~20.
+struct turbo3_c2_tab {
+    float2 v[64];   // v[(s1<<5)|(s0<<4)|(f1<<2)|f0] = signed centroids of fields 0 and 1
+    __host__ __device__ constexpr turbo3_c2_tab() : v{} {
+        for (unsigned n = 0; n < 64; ++n) {
+            const unsigned f0 = (n >> 0) & 3u, f1 = (n >> 2) & 3u;
+            const unsigned s0 = (n >> 4) & 1u, s1 = (n >> 5) & 1u;
+            v[n].x = turbo3_centroid_c(f0 | (s0 << 2));
+            v[n].y = turbo3_centroid_c(f1 | (s1 << 2));
+        }
+    }
+};
+
+static __device__ constexpr turbo3_c2_tab TURBO3_C2_TAB{};
+
+// Compile-time proof that the table IS the reference codebook.  It checks a host copy of the
+// object (a __device__ constexpr object is not host-readable), which is exactly what needs
+// checking: the constructor, and the index derivation that replaces the scalar one.
+static constexpr bool turbo3_centroid_c_ok() {
+    for (unsigned i = 0; i < 8; ++i) {
+        if (turbo3_centroid_c(i) != TURBO_C3_REF[i]) return false;
+    }
+    return true;
+}
+static constexpr bool turbo3_ctab_ok(const turbo3_c4_tab & t) {
+    for (unsigned hi1 = 0; hi1 < 2; ++hi1) {
+        for (unsigned b = 0; b < 256; ++b) {
+            const float4 & e = t.v[(hi1 << 8) | b];
+            const float   got[4]  = { e.x, e.y, e.z, e.w };
+            const float  want[4]  = { TURBO_C3_REF[((b >> 0) & 3u) | (hi1 << 2)],
+                                      TURBO_C3_REF[((b >> 2) & 3u) | (hi1 << 2)],
+                                      TURBO_C3_REF[((b >> 4) & 3u) | (hi1 << 2)],
+                                      TURBO_C3_REF[((b >> 6) & 3u) | (hi1 << 2)] };
+            for (int i = 0; i < 4; ++i) {
+                if (got[i] != want[i]) return false;
+            }
+        }
+    }
+    return true;
+}
+static constexpr turbo3_c4_tab TURBO3_C4_TAB_CHECK{};
+// Cross-check, not a duplicate of the assert above: the S8c scalar path and the S8 float4 path
+// derive the codebook index differently (`(qb >> 2l & 3) | (sb >> l & 1) << 2` vs a byte-indexed
+// entry plus a |256 half select).  Both must land on the same codebook entry, so the scalar table is
+// compared against the float4 table built by a different constructor, not against TURBO_C3_REF again.
+static constexpr bool turbo3_c8tab_ok(const turbo3_c8_tab & t, const turbo3_c4_tab & q) {
+    for (unsigned i = 0; i < 8; ++i) {
+        const unsigned b    = i & 3u;                    // field 0 of byte b holds code i & 3
+        const unsigned hi1  = (i & 4u) >> 2;             // the sign bit is the table half
+        if (t.v[i] != q.v[(hi1 << 8) | b].x) return false;
+    }
+    return true;
+}
+static constexpr turbo3_c8_tab TURBO3_C8_TAB_CHECK{};
+// Same cross-check idea for S8e: its 6-bit index must select the same centroid the float4 table
+// selects from the byte form, including the magnitude reflection that the sign bit causes.
+static constexpr bool turbo3_c2tab_ok(const turbo3_c2_tab & t, const turbo3_c4_tab & q) {
+    for (unsigned n = 0; n < 64; ++n) {
+        const unsigned f0 = (n >> 0) & 3u, f1 = (n >> 2) & 3u;
+        const unsigned s0 = (n >> 4) & 1u, s1 = (n >> 5) & 1u;
+        const unsigned b  = f0 | (f1 << 2);
+        if (t.v[n].x != q.v[(s0 << 8) | b].x) return false;
+        if (t.v[n].y != q.v[(s1 << 8) | b].y) return false;
+    }
+    return true;
+}
+static constexpr turbo3_c2_tab TURBO3_C2_TAB_CHECK{};
+static_assert(turbo3_centroid_c_ok(),    "turbo3_centroid_c differs from TURBO_C3_REF");
+static_assert(turbo3_ctab_ok(TURBO3_C4_TAB_CHECK), "S8 turbo3 V centroid table differs from TURBO_C3_REF");
+static_assert(turbo3_c8tab_ok(TURBO3_C8_TAB_CHECK, TURBO3_C4_TAB_CHECK),
+              "S8c scalar V table disagrees with the S8 float4 table");
+static_assert(turbo3_c2tab_ok(TURBO3_C2_TAB_CHECK, TURBO3_C4_TAB_CHECK),
+              "S8e float2 V table disagrees with the S8 float4 table");
+#endif // GGML_CUDA_FATTN_VEC_VTAB
+
 // ---- Inline dequant helpers: extract one float from a block (rotated domain) ----
 // The *_dithered variants are for blocks written by k_set_rows_turbo3/4 with the subtractive
 // dither: the block pointer is the block itself (row-relative indexing is the caller's business)
