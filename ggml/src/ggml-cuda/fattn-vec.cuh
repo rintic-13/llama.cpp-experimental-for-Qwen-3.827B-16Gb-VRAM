@@ -14,6 +14,31 @@ static bool ggml_cuda_fattn_vec_kq_mma_enabled() {
     return val;
 }
 
+// DIAGNOSTIC ONLY (never set in a production build): bit 1 zeroes the turbo4 dither, bit 2 replaces
+// the turbo4 centroid select-tree with one I2F+FMUL.  Attributes the fused KQ walk's *instruction*
+// cost between the hash (dither) and the decode (centroid) - the two blocks the SASS histogram is
+// dominated by (LOP3+FSEL+SEL+R2P+SHF = half of the 12176 instructions per tile). Numerics are
+// meaningless with either bit set; used by probe builds only.
+#ifndef GGML_CUDA_FATTN_VEC_COST
+#define GGML_CUDA_FATTN_VEC_COST 0
+#endif
+
+// S7 (2026-11-03): byte-indexed centroid table for the fused turbo4 KQ walk.
+//
+// The fused builder decodes two 4-bit centroids per K byte, and `turbo4_centroid_mag` is a 3-level
+// binary tree over 8 Lloyd-Max magnitudes = 7 FSEL + index work per value, which is the provable
+// minimum for an 8-to-1 mux - so the *code* cannot get shorter.  But the table only has 256
+// possible inputs (one byte = two nibbles) and 512 possible outputs (two floats), so the whole
+// decode fits in 2 KB of shared memory and one LDS.64 replaces [8 FSEL + 2-3 index ops] per byte.
+// Measured cost of the tree: 17.9% of the kernel's 12176 instructions, worth ~20% of its time
+// (GGML_CUDA_FATTN_VEC_COST=2 => 1.068 -> 0.849 ms).  The table is filled from the same
+// turbo4_centroid(), so the values - and therefore the fragments - are bit-identical.
+// Cost: +2048 B smem (6912 B total, still 3 blocks/SM), 1 __syncthreads() per launch, and 256
+// LDS.* per warp-tile instead of ~2000 ALU ops.
+#ifndef GGML_CUDA_FATTN_VEC_CEN_TAB
+#define GGML_CUDA_FATTN_VEC_CEN_TAB 0
+#endif
+
 // Fused f16 KQ^T in the vec kernel (GGML_CUDA_FATTN_VEC_KQ_MMA_F16=1, NVFP4 K only):
 // K is read as unmodified block_nvfp4 cache bytes and decoded E2M1+UE4M3 -> f16 fragment words
 // directly in registers (the m16n8k16 map is lane-aligned, so no smem staging and no f16 KV is
@@ -64,6 +89,98 @@ static bool ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled() {
     return val;
 }
 
+// S6 (2026-11-03): register-only software pipeline of the fused turbo KQ walk.
+//
+// Every mma in the fused path consumes the two A-fragment words that the two LDGs immediately
+// before it produced, so the f walk is a 16-step load->decode->mma dependency chain.  ptxas cannot
+// hoist it (16 fragments x 2 rows = 32+ live dwords at a 168-register budget), and the measured
+// evidence says latency hiding is exactly what this kernel lacks: S2d 3 blocks/SM = -22% vs 2,
+// while MIN_BLOCKS=4 (128 regs) = +11% (more TLP does not pay) and the S5 tile-level cp.async
+// prefetch = +3.5% even at EQUAL occupancy 2 (see s5_gate_20261103.log).  So the free lever left
+// is ILP inside one warp, not more warps and not smem: keep fragment f+1's raw bytes in registers
+// while fragment f decodes and multiplies.  Depth 1 costs ~6 live dwords, no smem, no occupancy
+// change; the tile-level S5 route is untouched and stays off.
+//
+// Bitwise: identical bytes, identical arithmetic, only the issue order of the loads changes.
+//
+// Modes (GGML_CUDA_FATTN_VEC_TURBO_KQ_PF), all bitwise-neutral:
+//   1 = register fragment pipeline (f+1's raw bytes live while f decodes + multiplies)
+//   2 = one warp-wide prefetch of the NEXT tile's 32 warp rows into L2 (no destination register,
+//       no smem, no occupancy cost - the cheapest possible answer to "is the K exposure latency?")
+//   4 = same prefetch into L1 (only useful if the K stream is L2-resident, which the 6:1 GQA
+//       sharing makes likely)
+//   8 = prefetch 2 tiles ahead instead of 1
+#ifndef GGML_CUDA_FATTN_VEC_TURBO_KQ_PF
+#define GGML_CUDA_FATTN_VEC_TURBO_KQ_PF 0
+#endif
+// v1 scope = turbo4 K, D=256, ncols=1, fused path (the only shape where the SASS chain was
+// measured).  turbo5 keeps the straight-line builder: its fragment needs 4 extra sign bytes, i.e.
+// 10 live dwords of prefetch state at the same 168-register cap.
+template <int D, int ncols, ggml_type type_K, bool KQ_mma, bool KQ_f16dq>
+__host__ __device__ constexpr int ggml_cuda_fattn_vec_turbo_kq_pf() {
+    return (KQ_f16dq && !KQ_mma && ncols == 1 && D == 256 && type_K == GGML_TYPE_TURBO4_0)
+               ? GGML_CUDA_FATTN_VEC_TURBO_KQ_PF : 0;
+}
+
+// Raw bytes of one fused turbo k-fragment for one lane (the two K rows it owns, at sub-column tg).
+// Split from the decode so the loop can prefetch it one fragment ahead.
+template <ggml_type type_K> struct ggml_cuda_turbo_kq_raw;
+
+template <> struct ggml_cuda_turbo_kq_raw<GGML_TYPE_TURBO4_0> {
+    uint32_t q00, q01, q10, q11;
+    float    n0,  n1;
+};
+
+template <> struct ggml_cuda_turbo_kq_raw<GGML_TYPE_TURBO5_0> {
+    uint32_t q00, q01, q10, q11;
+    uint32_t s00, s01, s10, s11;
+    float    n0,  n1;
+};
+
+template <ggml_type type_K>
+static __device__ __forceinline__ ggml_cuda_turbo_kq_raw<type_K> ggml_cuda_fattn_turbo_kq_afrag_load(
+        const char * __restrict__ Kb0, const char * __restrict__ Kb1, const int f, const int tg) {
+    static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0,
+                  "turbo kq_afrag: unsupported type_K");
+
+    const int cc = f & 7;   // 16-coord chunk inside the 128-coord block
+    ggml_cuda_turbo_kq_raw<type_K> r;
+
+    if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+        const block_turbo4_0 * b0 = (const block_turbo4_0 *) Kb0;
+        const block_turbo4_0 * b1 = (const block_turbo4_0 *) Kb1;
+
+        r.n0  = __half2float(b0->norm);
+        r.n1  = __half2float(b1->norm);
+
+        // Nibble packing: byte j/2 holds coords (j, j+1) low/high (j even) -> e0 byte 8cc+tg,
+        // e1 byte 8cc+4+tg (coords +8).  Dither word w = j/4: w0 = 4cc + (tg>>1), w1 = w0+2,
+        // lane j%4 = 2*(tg&1) (see the dither contract in ggml-common.h).
+        r.q00 = b0->qs[8*cc + tg + 0];
+        r.q01 = b0->qs[8*cc + tg + 4];
+        r.q10 = b1->qs[8*cc + tg + 0];
+        r.q11 = b1->qs[8*cc + tg + 4];
+    } else {
+        const block_turbo5_0 * b0 = (const block_turbo5_0 *) Kb0;
+        const block_turbo5_0 * b1 = (const block_turbo5_0 *) Kb1;
+
+        r.n0  = __half2float(b0->norm);
+        r.n1  = __half2float(b1->norm);
+
+        r.q00 = b0->qs[8*cc + tg + 0];
+        r.q01 = b0->qs[8*cc + tg + 4];
+        r.q10 = b1->qs[8*cc + tg + 0];
+        r.q11 = b1->qs[8*cc + tg + 4];
+
+        r.s00 = b0->signs[2*cc + 0];
+        r.s01 = b0->signs[2*cc + 1];
+        r.s10 = b1->signs[2*cc + 0];
+        r.s11 = b1->signs[2*cc + 1];
+    }
+
+    return r;
+}
+
 // Fused turbo KQ: build the four f16x2 A-fragment words of one m16n8k16 tile for a pair of K
 // token rows (one 16-coord k-fragment f, lane sub-column tg).  Fragment word order matches the
 // mma operand order below: {row0:e0, row1:e0, row0:e1, row1:e1} where e0/e1 cover coord pairs
@@ -74,29 +191,38 @@ static bool ggml_cuda_fattn_vec_turbo_kq_mma_f16_enabled() {
 // the coord->byte mapping and is verified coordinate-by-coordinate against the element
 // reference by tools/fa_turbo_frag_probe.cu (the NVFP4_FA_RESEARCH.md SS10j mapping-bug class).
 template <ggml_type type_K>
-static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag(
-        const char * __restrict__ Kb0, const char * __restrict__ Kb1,
+static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag_build(
+        const ggml_cuda_turbo_kq_raw<type_K> & r,
         const int f, const int tg, const uint32_t seed0, const uint32_t seed1,
-        uint32_t A[4]) {
+        uint32_t A[4], const float2 * __restrict__ cen = nullptr) {
     static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0,
                   "turbo kq_afrag: unsupported type_K");
 
     const int cc = f & 7;   // 16-coord chunk inside the 128-coord block
 
+    // S7: pair of centroids for one packed byte (low nibble = .x, high nibble = .y).
+    constexpr bool cen_tab = GGML_CUDA_FATTN_VEC_CEN_TAB != 0 &&
+                             (GGML_CUDA_FATTN_VEC_COST & 2) == 0 &&
+                             type_K == GGML_TYPE_TURBO4_0;
+    auto cen2 = [cen](const uint32_t v) {
+        if constexpr (cen_tab) {
+            return cen[v & 0xFF];
+        } else if constexpr ((GGML_CUDA_FATTN_VEC_COST & 2) != 0) {
+            return make_float2((float) (v & 0xF) * 0.015625f, (float) ((v >> 4) & 0xF) * 0.015625f);
+        } else {
+            return make_float2(turbo4_centroid(v & 0xF), turbo4_centroid(v >> 4));
+        }
+    };
+    (void) cen;
+
     if constexpr (type_K == GGML_TYPE_TURBO4_0) {
-        const block_turbo4_0 * b0 = (const block_turbo4_0 *) Kb0;
-        const block_turbo4_0 * b1 = (const block_turbo4_0 *) Kb1;
+        const float n0 = r.n0;
+        const float n1 = r.n1;
 
-        const float n0 = __half2float(b0->norm);
-        const float n1 = __half2float(b1->norm);
-
-        // Nibble packing: byte j/2 holds coords (j, j+1) low/high (j even) -> e0 byte 8cc+tg,
-        // e1 byte 8cc+4+tg (coords +8).  Dither word w = j/4: w0 = 4cc + (tg>>1), w1 = w0+2,
-        // lane j%4 = 2*(tg&1) (see the dither contract in ggml-common.h).
-        const uint8_t q00 = b0->qs[8*cc + tg + 0];
-        const uint8_t q01 = b0->qs[8*cc + tg + 4];
-        const uint8_t q10 = b1->qs[8*cc + tg + 0];
-        const uint8_t q11 = b1->qs[8*cc + tg + 4];
+        const uint32_t q00 = r.q00;
+        const uint32_t q01 = r.q01;
+        const uint32_t q10 = r.q10;
+        const uint32_t q11 = r.q11;
 
         // Register-only dither (S2c): each lane consumes only lanes (2hi, 2hi+1) of the group, hi = tg&1.
         // The old float[4] out-param form + runtime kl index put the groups in LOCAL MEMORY
@@ -109,39 +235,40 @@ static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag(
         dv0 = turbo_dither4_pair(seed1, 4*cc + (tg >> 1) + 0, dhi, TURBO_DITHER_STEP_4BIT);
         dv1 = turbo_dither4_pair(seed1, 4*cc + (tg >> 1) + 2, dhi, TURBO_DITHER_STEP_4BIT);
 #endif
+        // DIAGNOSTIC ONLY (GGML_CUDA_FATTN_VEC_COST, probe builds): bit 1 zeroes the four dither
+        // pairs, bit 2 replaces the centroid tree with one I2F+FMUL, so the *instruction* cost of
+        // each component can be attributed statically (cuobjdump -sass) or by time. Numerics are
+        // meaningless with either bit set.
+        if constexpr ((GGML_CUDA_FATTN_VEC_COST & 1) != 0) {
+            du0 = du1 = dv0 = dv1 = make_float2(0.0f, 0.0f);
+        }
 
-        const half2 h00 = __floats2half2_rn((turbo4_centroid(q00 & 0xF) - du0.x) * n0,
-                                            (turbo4_centroid(q00 >>  4) - du0.y) * n0);
-        const half2 h01 = __floats2half2_rn((turbo4_centroid(q01 & 0xF) - du1.x) * n0,
-                                            (turbo4_centroid(q01 >>  4) - du1.y) * n0);
-        const half2 h10 = __floats2half2_rn((turbo4_centroid(q10 & 0xF) - dv0.x) * n1,
-                                            (turbo4_centroid(q10 >>  4) - dv0.y) * n1);
-        const half2 h11 = __floats2half2_rn((turbo4_centroid(q11 & 0xF) - dv1.x) * n1,
-                                            (turbo4_centroid(q11 >>  4) - dv1.y) * n1);
+        const float2 c00 = cen2(q00), c01 = cen2(q01), c10 = cen2(q10), c11 = cen2(q11);
+        const half2 h00 = __floats2half2_rn((c00.x - du0.x) * n0, (c00.y - du0.y) * n0);
+        const half2 h01 = __floats2half2_rn((c01.x - du1.x) * n0, (c01.y - du1.y) * n0);
+        const half2 h10 = __floats2half2_rn((c10.x - dv0.x) * n1, (c10.y - dv0.y) * n1);
+        const half2 h11 = __floats2half2_rn((c11.x - dv1.x) * n1, (c11.y - dv1.y) * n1);
 
         A[0] = *(const uint32_t *) &h00;
         A[1] = *(const uint32_t *) &h10;
         A[2] = *(const uint32_t *) &h01;
         A[3] = *(const uint32_t *) &h11;
     } else if constexpr (type_K == GGML_TYPE_TURBO5_0) {
-        const block_turbo5_0 * b0 = (const block_turbo5_0 *) Kb0;
-        const block_turbo5_0 * b1 = (const block_turbo5_0 *) Kb1;
-
-        const float n0 = __half2float(b0->norm);
-        const float n1 = __half2float(b1->norm);
+        const float n0 = r.n0;
+        const float n1 = r.n1;
 
         // 5-bit index: lo nibble like turbo4 + hi bit in signs[j/8] bit j%8.  For e0 (j=16cc+2tg,
         // +1) that is signs byte 2cc bits 2tg,2tg+1; e1 uses byte 2cc+1 at the same bit positions.
         // No dither in the turbo5 codec (vec_dot_fattn_vec_KQ_turbo5_0 has no u term).
-        const uint8_t q00 = b0->qs[8*cc + tg + 0];
-        const uint8_t q01 = b0->qs[8*cc + tg + 4];
-        const uint8_t q10 = b1->qs[8*cc + tg + 0];
-        const uint8_t q11 = b1->qs[8*cc + tg + 4];
+        const uint32_t q00 = r.q00;
+        const uint32_t q01 = r.q01;
+        const uint32_t q10 = r.q10;
+        const uint32_t q11 = r.q11;
 
-        const uint8_t s00 = b0->signs[2*cc + 0];
-        const uint8_t s01 = b0->signs[2*cc + 1];
-        const uint8_t s10 = b1->signs[2*cc + 0];
-        const uint8_t s11 = b1->signs[2*cc + 1];
+        const uint32_t s00 = r.s00;
+        const uint32_t s01 = r.s01;
+        const uint32_t s10 = r.s10;
+        const uint32_t s11 = r.s11;
 
         const half2 h00 = __floats2half2_rn(turbo5_centroid((q00 & 0xF) | (((s00 >> (2*tg    )) & 1) << 4)) * n0,
                                             turbo5_centroid((q00 >>  4) | (((s00 >> (2*tg + 1)) & 1) << 4)) * n0);
@@ -157,6 +284,18 @@ static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag(
         A[2] = *(const uint32_t *) &h01;
         A[3] = *(const uint32_t *) &h11;
     }
+}
+
+// Straight-line form (load + build) kept as the reference entry point: the frag probe and every
+// non-prefetching instantiation use it, so the coord->byte mapping has one implementation only.
+template <ggml_type type_K>
+static __device__ __forceinline__ void ggml_cuda_fattn_turbo_kq_afrag(
+        const char * __restrict__ Kb0, const char * __restrict__ Kb1,
+        const int f, const int tg, const uint32_t seed0, const uint32_t seed1,
+        uint32_t A[4], const float2 * __restrict__ cen = nullptr) {
+    const ggml_cuda_turbo_kq_raw<type_K> r =
+        ggml_cuda_fattn_turbo_kq_afrag_load<type_K>(Kb0, Kb1, f, tg);
+    ggml_cuda_fattn_turbo_kq_afrag_build<type_K>(r, f, tg, seed0, seed1, A, cen);
 }
 
 // UE4M3 encode matching ggml_fp32_to_ue4m3 (used to requantize Q rows for the FP4 mma).
@@ -253,6 +392,90 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #ifndef GGML_CUDA_FATTN_VEC_MIN_BLOCKS
 #define GGML_CUDA_FATTN_VEC_MIN_BLOCKS 1
 #endif
+// S5 cp.async K staging (design 2026-11-03): the fused turbo decode path reads the whole KV stream
+// as synchronous 32-bit LDGs (SASS census: 403 LDG.E, zero LDGSTS, zero LDG.64/128 - the packed rows
+// are 2B-blocked so ptxas can never widen them). The kernel is latency-bound, not DRAM/LSU-bound
+// (~28 GB/s effective vs 448 GB/s bus; MB3 occupancy alone bought -22%), so the S5 lever is
+// staging the next K tile into shared memory with cp.async.ca (4B granule is legal: a D=256 turbo
+// K row is 132/196 B, both %4==0) while the current tile computes. Warp-local: warp ty stages and
+// consumes exactly the 32 rows tok0=32*ty that its MMA walk touches, so only __syncwarp() is needed,
+// never __syncthreads(). 2x128-row double buffer = 33.8 KB static smem -> 2 blocks/SM with the full
+// 255-reg budget. Bitwise: pure transport, the afrag builder reads the identical byte layout.
+// Opt-in at compile time; gate: fused turbo-K D=256 decode shape only (nvfp4/other types untouched).
+// v1 scope is turbo4 ONLY: the double buffer is static smem (max 48 KiB without cudaFuncSetAttribute
+// opt-in) and turbo5's 196 B row gives 2*128*196 = 50.2 KiB > 48 KiB.  Turbo5 would need dynamic smem
+// (which caps it at 1 block/SM and loses the S2d 3-block register policy) - revisit only if S5 wins.
+#ifndef GGML_CUDA_FATTN_VEC_CPASYNC
+#define GGML_CUDA_FATTN_VEC_CPASYNC 0
+#endif
+// DIAGNOSTIC ONLY (never set in a production build): collapses a row stride to 0 for one side of
+// the decode loop, so every row of a tile is served from one cache line.  Isolates "latency of the
+// K walk" (bit 1) from "latency of the PV walk" (bit 2) - the byte-sensitivity tests in
+// s6_gate_20261103.log cannot separate them (t3 vs t4 V differs in bytes but not in chain depth).
+// Used by probe builds only; numerics are meaningless with it on.
+#ifndef GGML_CUDA_FATTN_VEC_ATTR
+#define GGML_CUDA_FATTN_VEC_ATTR 0
+#endif
+// (GGML_CUDA_FATTN_VEC_COST is defined at the top of this file - the fused builder above uses it.)
+template <int D, int ncols, ggml_type type_K, bool KQ_mma, bool KQ_f16dq>
+__host__ __device__ constexpr bool ggml_cuda_fattn_vec_cp_async_k() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
+    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE)
+    return GGML_CUDA_FATTN_VEC_CPASYNC != 0 && KQ_f16dq && !KQ_mma && ncols == 1 && D == 256 &&
+           type_K == GGML_TYPE_TURBO4_0;
+#else
+    return false;
+#endif
+}
+
+// cp.async group primitives (4 B granule: a turbo4 D=256 K row is 132 B and the cache row pitch
+// keeps every row 4 B-aligned; 16 B copies would need 16 B-aligned gmem rows, which they are not).
+// Groups are PER-LANE: each warp commits and waits its own stream, and since warp ty stages exactly
+// the rows its lanes consume, __syncwarp() (not __syncthreads) makes the staged bytes visible.
+// Defined on every pass (the host pass of a __global__ body may not contain inline asm), guarded
+// internally like cp-async.cuh.
+static __device__ __forceinline__ void ggml_cuda_cp_async_ca_4(const unsigned int dst, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" : : "r"(dst), "l"(src));
+#else
+    GGML_UNUSED_VARS(dst, src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+static __device__ __forceinline__ void ggml_cuda_cp_async_commit_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+template <int N>
+static __device__ __forceinline__ void ggml_cuda_cp_async_wait_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+// Stage one warp-subtile (32 rows starting at tok0, ROW_DW dwords per row) of a K tile into smem.
+template <int ROW_DW>
+static __device__ __forceinline__ void ggml_cuda_fattn_vec_kcp_stage(
+        const char * __restrict__ src, char * __restrict__ dst, const int64_t nb11, const int tok0) {
+#ifdef CP_ASYNC_AVAILABLE
+    const unsigned int dst0 = __cvta_generic_to_shared(dst);
+#pragma unroll
+    for (int i = threadIdx.x; i < WARP_SIZE * ROW_DW; i += WARP_SIZE) {
+        const int r = i / ROW_DW;
+        const int w = i - ROW_DW * r;
+        ggml_cuda_cp_async_ca_4(dst0 + 4u * ((unsigned) tok0*ROW_DW + (unsigned) i), src + (size_t) (tok0 + r) * nb11 + 4 * w);
+    }
+#else
+    GGML_UNUSED_VARS(src, dst, nb11, tok0);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 // Production policy (S2d gate, fa_turbo_ab_probe 2026-11-03): REG 255->168 with STACK still 0 gave
 // -18..-25% on BOTH dot and fused D256 rows (T1 1.412->1.100, T6 1.369->1.065) but +1..+1.4% (worse)
 // on q5_1-K and D128-dot rows, so 3 blocks/SM is enabled only where it measured faster: turbo K at
@@ -261,16 +484,23 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 // measured). The ncols=2 (nq>1) turbo D256 rows spill 80-96 B/thread in cuobjdump AT BOTH register
 // budgets (255 and 168), i.e. that spill is intrinsic to the shape, not caused by the cap - but the
 // shape was never timed, so it keeps today's codegen (min_blocks=1) until someone measures it.
-template <int D, int ncols, ggml_type type_K>
+template <int D, int ncols, ggml_type type_K, bool KQ_mma, bool KQ_f16dq>
 constexpr int ggml_cuda_fattn_vec_min_blocks() {
     if (GGML_CUDA_FATTN_VEC_MIN_BLOCKS > 1) {
         return GGML_CUDA_FATTN_VEC_MIN_BLOCKS;
+    }
+    // S5: the cp.async K double buffer adds 2*nthreads*132 B = 33.8 KiB static smem, so 2 blocks/SM
+    // fit (70.8 KiB + the ~1.6 KiB of KQ/F4_raw state < 100 KiB) while keeping the FULL 255-reg
+    // budget - the cp.async prefetch is what hides latency here, occupancy is deliberately lowered
+    // from the S2d 3-block policy for this one shape and re-measured (probe T6).
+    if (ggml_cuda_fattn_vec_cp_async_k<D, ncols, type_K, KQ_mma, KQ_f16dq>()) {
+        return 2;
     }
     return (D == 256 && ncols == 1 && (type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0)) ? 3 : 1;
 }
 
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool KQ_mma = false, bool KQ_f16dq = false> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), ggml_cuda_fattn_vec_min_blocks<D, ncols, type_K>())
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), ggml_cuda_fattn_vec_min_blocks<D, ncols, type_K, KQ_mma, KQ_f16dq>())
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
@@ -403,6 +633,61 @@ static __global__ void flash_attn_ext_vec(
     __shared__ int  F4_Knc[KQ_mma ? 32*F4_STR      : 1];
     __shared__ int  F4_Ksc[KQ_mma ? 32*(D/64)      : 1];
     __shared__ float F4_raw[(KQ_mma || KQ_f16dq) ? ncols*nthreads : 1];
+
+    // S5: cp.async K staging double buffer (see the design note above ggml_cuda_fattn_vec_cp_async_k).
+    // Tile-native VRAM byte layout: buffer b, row r of the 128-row tile at KCP_raw[b*nthreads + r],
+    // KCP_ROW = full VRAM row pitch in bytes (D/128 blocks; 132 for turbo4 D=256, %4==0 so every row
+    // base stays 4 B-aligned for cp.async and for the block_turbo4_0 casts inside afrag).  Warp ty
+    // stages / consumes only rows [32*ty, 32*ty+32) - exactly the rows its MMA walk (tok0=32*ty)
+    // touches - so the buffers never cross warps.  Pure transport: identical bytes, identical seeds
+    // (k_tile_ibase still derives from the VRAM pointer), bitwise-equal results.
+    constexpr bool cp_async_k = ggml_cuda_fattn_vec_cp_async_k<D, ncols, type_K, KQ_mma, KQ_f16dq>();
+    // S6: bitmask of prefetch modes for the fused turbo KQ walk (see the note above
+    // ggml_cuda_fattn_vec_turbo_kq_pf). Independent of S5; both can be off/on.
+    constexpr int  turbo_pf_mode = ggml_cuda_fattn_vec_turbo_kq_pf<D, ncols, type_K, KQ_mma, KQ_f16dq>();
+    constexpr bool turbo_pf      = (turbo_pf_mode & 1) != 0;   // register fragment pipeline
+    constexpr int  turbo_pf_dist = (turbo_pf_mode & 8) ? 2 : ((turbo_pf_mode & (2 | 4)) ? 1 : 0); // tile prefetch distance
+    constexpr bool turbo_pf_l1   = (turbo_pf_mode & 4) != 0;   // prefetch into L1 instead of L2
+    constexpr bool turbo_pf_self = (turbo_pf_mode & 16) != 0;  // prefetch this warp's own rows (dist 0)
+    constexpr bool turbo_pf_lead = (turbo_pf_mode & (32 | 64)) != 0; // rolling 8-fragment-lead prefetch
+    constexpr bool turbo_pf_lead_l2 = (turbo_pf_mode & 64) != 0;  // ... into L2 instead of L1
+    // DIAGNOSTIC (GGML_CUDA_FATTN_VEC_ATTR, probe builds only - see its definition above).
+    constexpr bool attr_k = (GGML_CUDA_FATTN_VEC_ATTR & 1) != 0;
+    constexpr bool attr_v = (GGML_CUDA_FATTN_VEC_ATTR & 2) != 0;
+    constexpr int  KCP_ROW    = cp_async_k ? (D / (128)) * (int) k_blk_bytes : 1; // == nb11 by launcher shape
+    static_assert(!cp_async_k || KCP_ROW % 4 == 0, "cp.async K: row pitch must be 4B granular");
+    __shared__ unsigned KCP_raw[cp_async_k ? (2*nthreads*KCP_ROW) / 4 : 1];
+
+    // S5 forensics knob: dead static smem to force the same occupancy/pb cascade a large KCP buffer
+    // causes (cudaOccupancyMaxActiveBlocksPerMultiprocessor -> launch_fattn parallel_blocks) WITHOUT
+    // enabling cp.async. Isolates "cost of the occupancy cascade" from "value of the prefetch".
+    // Diagnostic builds only (-DGGML_CUDA_FATTN_VEC_SMEM_PAD=<bytes>); default 0, never in production.
+#ifndef GGML_CUDA_FATTN_VEC_SMEM_PAD
+#define GGML_CUDA_FATTN_VEC_SMEM_PAD 0
+#endif
+    __shared__ unsigned KCP_pad[GGML_CUDA_FATTN_VEC_SMEM_PAD ? (GGML_CUDA_FATTN_VEC_SMEM_PAD / 4) : 1];
+    if constexpr (GGML_CUDA_FATTN_VEC_SMEM_PAD != 0) {
+        // Leak the buffer's address into an opaque asm barrier (memory clobber): ptxas cannot then
+        // prove the allocation unused. A plain read/conditional-write IS dead code - the first
+        // pad38k run showed baseline 4864B smem, i.e. ptxas deleted the pad entirely.
+#ifdef __CUDA_ARCH__
+        asm volatile("" :: "r"((unsigned int) __cvta_generic_to_shared(KCP_pad)) : "memory");
+#else
+        GGML_UNUSED(KCP_pad);
+#endif // __CUDA_ARCH__
+    }
+
+    // S7: byte-indexed turbo4 centroid pairs (see the note at the top of the file).
+    constexpr bool cen_tab = GGML_CUDA_FATTN_VEC_CEN_TAB != 0 &&
+                             (GGML_CUDA_FATTN_VEC_COST & 2) == 0 &&
+                             KQ_f16dq && !KQ_mma && type_K == GGML_TYPE_TURBO4_0;
+    __shared__ float2 KCEN[cen_tab ? 256 : 1];
+    if constexpr (cen_tab) {
+        for (int b = WARP_SIZE*threadIdx.y + threadIdx.x; b < 256; b += nthreads) {
+            KCEN[b] = make_float2(turbo4_centroid(b & 0xF), turbo4_centroid(b >> 4));
+        }
+        __syncthreads();
+    }
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -608,9 +893,66 @@ static __global__ void flash_attn_ext_vec(
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
+
+    // S5 pipeline state: cp_stride = tile size in rows (one loop iteration), cp_tok0 = the row span
+    // this warp stages AND later consumes (tok0 of the fused MMA walk).
+    const int cp_stride = gridDim.y * nthreads;
+    const int cp_tok0   = WARP_SIZE * threadIdx.y;
+    if constexpr (cp_async_k) {
+        if (blockIdx.y*nthreads < k_VKQ_max) { // same condition as the loop entry below
+            ggml_cuda_fattn_vec_kcp_stage<KCP_ROW / 4>((const char *) K, (char *) KCP_raw, nb11, cp_tok0);
+        }
+        ggml_cuda_cp_async_commit_group(); // empty group keeps the per-lane count uniform if absent
+    }
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+        if constexpr (cp_async_k) {
+            // Stage the tile this block will consume in the NEXT iteration into the other buffer and
+            // wait for the tile staged before this iteration: groups are per-lane, so wait_group 1
+            // leaves exactly the just-committed group in flight, and __syncwarp() publishes the other
+            // lanes' staged bytes to this warp's fragment loads (staging is warp-local, see above).
+            // The staged range [K+cp_stride, +128 rows) is exactly what the next iteration's MMA walk
+            // would have read from VRAM - no new addresses, no new faults, garbage rows identical.
+            const int kcp_buf = (k_VKQ_0 / cp_stride) & 1; // blockIdx.y*nthreads < cp_stride
+            if (k_VKQ_0 + cp_stride < k_VKQ_max) {
+                ggml_cuda_fattn_vec_kcp_stage<KCP_ROW / 4>(
+                        K + (int64_t) cp_stride * nb11,
+                        (char *) KCP_raw + (size_t) (kcp_buf ^ 1) * nthreads * KCP_ROW,
+                        nb11, cp_tok0);
+            }
+            ggml_cuda_cp_async_commit_group();
+            ggml_cuda_cp_async_wait_group<1>();
+            __syncwarp();
+        }
+
+        if constexpr (turbo_pf_self) {
+            // S6 mode 16: fetch this warp's own 32 rows at the top of the tile, i.e. at distance 0.
+            // The only remaining point on the "how early" axis after tile-ahead L1/L2 both lost.
+            const char * Kp = K + (size_t) (cp_tok0 + threadIdx.x)*nb11;
+            asm volatile("prefetch.global.L1 [%0];" : : "l"(Kp));
+            asm volatile("prefetch.global.L1 [%0];" : : "l"(Kp + 128));
+        }
+        if constexpr (turbo_pf_dist != 0) {
+            // S6 mode 2/4/8: warp-wide prefetch of the tile this block consumes turbo_pf_dist
+            // iterations later.  Zero registers, zero smem, no occupancy change - it only asks the
+            // cache hierarchy to start the fetch earlier, which is the question the register
+            // pipeline (mode 1) could not answer inside a 168-register budget.
+            // One lane per row (the 32 rows this warp owns), two lines per row because a row is
+            // nb11 = (D/128)*k_blk_bytes bytes and nb11 is not a multiple of the 128 B line.
+            if (k_VKQ_0 + turbo_pf_dist*cp_stride < k_VKQ_max) {
+                const char * Kp = K + (int64_t) turbo_pf_dist*cp_stride*nb11 +
+                                  (size_t) (cp_tok0 + threadIdx.x)*nb11;
+                if constexpr (turbo_pf_l1) {
+                    asm volatile("prefetch.global.L1 [%0];" : : "l"(Kp));
+                    asm volatile("prefetch.global.L1 [%0];" : : "l"(Kp + 128));
+                } else {
+                    asm volatile("prefetch.global.L2 [%0];" : : "l"(Kp));
+                    asm volatile("prefetch.global.L2 [%0];" : : "l"(Kp + 128));
+                }
+            }
+        }
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -744,13 +1086,99 @@ static __global__ void flash_attn_ext_vec(
                     static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0,
                                   "KQ_f16dq: unexpected fused type_K");
 
+                    // DIAGNOSTIC (attr_k, GGML_CUDA_FATTN_VEC_ATTR bit 1): with the row stride
+                    // collapsed, all 32 rows of the warp resolve to the same cache line, i.e. the K
+                    // walk becomes L1-resident. Timing only, numerics are meaningless.
+                    const size_t  koff_a = attr_k ? 0 : koff;
+                    const int64_t nb11_a = attr_k ? 0 : nb11;
+
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
                         float Dt[4] = { 0.f, 0.f, 0.f, 0.f };
+
+                        // S6 pipeline state (see ggml_cuda_fattn_vec_turbo_kq_pf): the two row bases
+                        // and the two dither-seed bases do not depend on f, so they are computed
+                        // once per mt; kraw is the fragment that is currently in flight.
+                        const char * Kr0 = K;
+                        const char * Kr1 = K;
+                        int64_t sd0 = 0, sd1 = 0;
+                        ggml_cuda_turbo_kq_raw<type_K> kraw{};
+                        if constexpr (turbo_pf) {
+                            if constexpr (cp_async_k) {
+                                const char * KCP = (const char *) KCP_raw +
+                                                   ((size_t) ((k_VKQ_0 / cp_stride) & 1) * nthreads + cp_tok0) * KCP_ROW;
+                                Kr0 = KCP + (size_t) (16*mt + g + 0)*KCP_ROW;
+                                Kr1 = KCP + (size_t) (16*mt + g + 8)*KCP_ROW;
+                            } else {
+                                Kr0 = K + koff_a + (size_t) (16*mt + 0)*nb11_a;
+                                Kr1 = K + koff_a + (size_t) (16*mt + 8)*nb11_a;
+                            }
+                            // Dither seeds must match the vec_dot / set_rows contract: the LINEAR
+                            // block index of this row inside the cache tensor + the block-within-row
+                            // index (f>>3, QK_TURBO = 128 coords = 8 k-fragments).
+                            sd0 = k_tile_ibase + (int64_t) (16*mt + g + 0)*k_blk_per_row;
+                            sd1 = k_tile_ibase + (int64_t) (16*mt + g + 8)*k_blk_per_row;
+                            kraw = ggml_cuda_fattn_turbo_kq_afrag_load<type_K>(Kr0, Kr1, 0, tg);
+                        }
+
 #pragma unroll
                         for (int f = 0; f < D/16; ++f) {
-                            const char * Kb0 = K + koff + (size_t) (16*mt + 0)*nb11 + (size_t) (f >> 3) * (size_t) k_blk_bytes;
-                            const char * Kb1 = K + koff + (size_t) (16*mt + 8)*nb11 + (size_t) (f >> 3) * (size_t) k_blk_bytes;
+                            uint32_t A[4];
+
+                            if constexpr (turbo_pf_lead) {
+                                // S6 mode 32/64: rolling warp-local prefetch with a lead of exactly
+                                // one turbo block (8 k-fragments ~= 1000 cycles at the measured
+                                // 127 cycles/fragment).  Lane L covers row 32*ty+L, so the 32 lanes
+                                // cover the warp tile once - no redundancy, no extra registers.
+                                //  f == 0        -> block 1 of this tile (read at f == 8)
+                                //  mt == 1, f==0 -> block 0 of the NEXT tile (read ~16 fragments later)
+                                // Block 0 of the very first tile is the only cold access left.
+                                if (f == 0) {
+                                    const size_t prow = (size_t) (cp_tok0 + threadIdx.x)*nb11;
+                                    const char * pb = K + prow + (int64_t) k_blk_bytes;
+                                    if constexpr (turbo_pf_lead_l2) {
+                                        asm volatile("prefetch.global.L2 [%0];" : : "l"(pb));
+                                    } else {
+                                        asm volatile("prefetch.global.L1 [%0];" : : "l"(pb));
+                                    }
+                                    if (mt == 1 && k_VKQ_0 + cp_stride < k_VKQ_max) {
+                                        const char * pn = K + prow + (int64_t) cp_stride*nb11;
+                                        if constexpr (turbo_pf_lead_l2) {
+                                            asm volatile("prefetch.global.L2 [%0];" : : "l"(pn));
+                                        } else {
+                                            asm volatile("prefetch.global.L1 [%0];" : : "l"(pn));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if constexpr (turbo_pf) {
+                                // Issue the loads of fragment f+1, then decode f out of the copy
+                                // that was already in flight: f+1's LDGs overlap f's decode + mma.
+                                const ggml_cuda_turbo_kq_raw<type_K> kcur = kraw;
+                                if (f + 1 < D/16) {
+                                    const size_t kb = (size_t) ((f + 1) >> 3) * (size_t) k_blk_bytes;
+                                    kraw = ggml_cuda_fattn_turbo_kq_afrag_load<type_K>(
+                                            Kr0 + kb, Kr1 + kb, f + 1, tg);
+                                }
+                                ggml_cuda_fattn_turbo_kq_afrag_build<type_K>(kcur, f, tg,
+                                        (uint32_t) (sd0 + (f >> 3)), (uint32_t) (sd1 + (f >> 3)), A,
+                                        cen_tab ? KCEN : nullptr);
+                            } else {
+                            const char * Kb0, * Kb1;
+                            if constexpr (cp_async_k) {
+                                // S5: same row/block arithmetic as the gmem path below, but the tile
+                                // bytes were cp.async'd through smem one iteration earlier.  Row
+                                // pitch in smem is KCP_ROW == nb11, so the block_turbo4_0 casts and
+                                // byte offsets are identical - bitwise-equal fragments.
+                                const char * KCP = (const char *) KCP_raw +
+                                                   ((size_t) ((k_VKQ_0 / cp_stride) & 1) * nthreads + cp_tok0) * KCP_ROW;
+                                Kb0 = KCP + (size_t) (16*mt + g + 0)*KCP_ROW + (size_t) (f >> 3) * (size_t) k_blk_bytes;
+                                Kb1 = KCP + (size_t) (16*mt + g + 8)*KCP_ROW + (size_t) (f >> 3) * (size_t) k_blk_bytes;
+                            } else {
+                                Kb0 = K + koff_a + (size_t) (16*mt + 0)*nb11_a + (size_t) (f >> 3) * (size_t) k_blk_bytes;
+                                Kb1 = K + koff_a + (size_t) (16*mt + 8)*nb11_a + (size_t) (f >> 3) * (size_t) k_blk_bytes;
+                            }
 
                             // Dither seeds must match the vec_dot / set_rows contract: the LINEAR
                             // block index of this row inside the cache tensor + the block-within-row
@@ -758,8 +1186,9 @@ static __global__ void flash_attn_ext_vec(
                             const uint32_t seed0 = (uint32_t) (k_tile_ibase + (int64_t) (16*mt + g + 0)*k_blk_per_row + (f >> 3));
                             const uint32_t seed1 = (uint32_t) (k_tile_ibase + (int64_t) (16*mt + g + 8)*k_blk_per_row + (f >> 3));
 
-                            uint32_t A[4];
-                            ggml_cuda_fattn_turbo_kq_afrag<type_K>(Kb0, Kb1, f, tg, seed0, seed1, A);
+                            ggml_cuda_fattn_turbo_kq_afrag<type_K>(Kb0, Kb1, f, tg, seed0, seed1, A,
+                                    cen_tab ? KCEN : nullptr);
+                            }
 
                             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                                          "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -891,6 +1320,11 @@ static __global__ void flash_attn_ext_vec(
 
         ggml_cuda_syncwarp();
 
+        // DIAGNOSTIC (attr_v, GGML_CUDA_FATTN_VEC_ATTR bit 2): with the V row stride collapsed every
+        // row of the tile resolves to one cache line, isolating the PV walk's chain latency from its
+        // byte volume. Timing only.
+        const int64_t nb21_a = attr_v ? 0 : nb21;
+
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
@@ -909,14 +1343,14 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    dequantize_V(V + k*nb21_a, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, v_row_ibase);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V + k*nb21_a, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, v_row_ibase);
                 }
 #pragma unroll

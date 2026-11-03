@@ -148,6 +148,10 @@ static void variant(const char * name, const char * Kc, const char * Vc, int nb1
 
     // dump the final output (the last launch left the correct result in dst/meta) for bitwise diff
     uint64_t fnv = 1469598103934665603ull;
+    // cfnv = fnv over the MERGED, normalised per-head output. Unlike the raw dst/meta hash this is
+    // independent of parallel_blocks (gridDim.y), so it is the hash that may be compared across
+    // builds whose occupancy - and therefore pb - differs (S5 forensics, s5_gate_20261103.log).
+    uint64_t cfnv = 0;
     const size_t ndst = (size_t) ntiles_KV * D * NQ * NHEAD;   // worst-case tile count
     if (g_dump_dir[0] || snap) {
         std::vector<float> hd(ndst);
@@ -196,12 +200,16 @@ static void variant(const char * name, const char * Kc, const char * Vc, int nb1
                 }
             }
             snap->swap(merged);
+
+            cfnv = 1469598103934665603ull;
+            const uint8_t * pmm = (const uint8_t *) snap->data();
+            for (size_t i = 0; i < snap->size()*4; ++i) { cfnv = (cfnv ^ pmm[i]) * 1099511628211ull; }
         }
     }
 
-    printf("%-26s occ=%d pb=%d regs=%d smem=%zuB | med %7.3f ms  min %7.3f max %7.3f | %6.2f t/s-equiv | fnv %016llx\n",
+    printf("%-26s occ=%d pb=%d regs=%d smem=%zuB | med %7.3f ms  min %7.3f max %7.3f | %6.2f t/s-equiv | fnv %016llx | cfnv %016llx\n",
         name, max_blocks_sm, parallel_blocks, fa.numRegs, fa.sharedSizeBytes,
-        med, ms.front(), ms.back(), tok_per_s, (unsigned long long) fnv);
+        med, ms.front(), ms.back(), tok_per_s, (unsigned long long) fnv, (unsigned long long) cfnv);
 }
 
 // numerical A/B between the dot and fused paths (fused changes numerics by design: report the
