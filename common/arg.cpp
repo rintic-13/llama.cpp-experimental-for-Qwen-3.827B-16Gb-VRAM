@@ -313,6 +313,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
     GGML_TYPE_TURBO3_0,  // TurboQuant KV (WHT group 128 + 3-bit PolarQuant); requires flash attention, CUDA
     GGML_TYPE_TURBO4_0,  // TurboQuant KV (WHT group 128 + 4-bit PolarQuant); requires flash attention, CUDA
+    GGML_TYPE_TURBO5_0,  // TurboQuant KV (WHT group 128 + 5-bit PolarQuant); requires flash attention, CUDA
+    GGML_TYPE_TURBO3Q_0, // TurboQuant KV Q_prod (2-bit PolarQuant + 1-bit QJL residual sign); requires flash attention, CUDA
+    GGML_TYPE_TURBO4Q_0, // TurboQuant KV Q_prod (3-bit PolarQuant + 1-bit QJL residual sign); requires flash attention, CUDA
+    GGML_TYPE_NVFP4,     // NVFP4-like KV cache (single-level: per-16 UE4M3 scale + E2M1, unrotated); requires flash attention, CUDA
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

@@ -52,8 +52,10 @@ endfunction()
 
 # Determines which FlashAttention vector kernel template instances to compile, returns them in OUT_SRCS.
 function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
-    # TurboQuant types (turbo2_0 intentionally not offered: only turbo3/turbo4 kernels exist in this fork).
-    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16 turbo4_0 turbo3_0)
+    # TurboQuant types (turbo2_0 intentionally not offered: only turbo3/turbo4/turbo5 kernels exist in this fork).
+    # turbo3q_0/turbo4q_0: Q_prod variants (MSE codebook + 1-bit QJL residual sign, arXiv 2504.19874 Alg. 2).
+    # nvfp4: NVFP4-like KV cache (Stage A; single-level per-16 UE4M3 + E2M1, unrotated, no dither).
+    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16 turbo4_0 turbo3_0 turbo5_0 turbo4q_0 turbo3q_0 nvfp4)
 
     string(TOLOWER "${GGML_CUDA_FA_QUANTS}" FA_QUANTS)
     string(STRIP   "${FA_QUANTS}" FA_QUANTS)

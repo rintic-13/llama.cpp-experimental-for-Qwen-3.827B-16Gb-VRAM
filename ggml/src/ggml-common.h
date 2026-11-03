@@ -458,6 +458,152 @@ typedef struct {
 static_assert(sizeof(block_turbo4_0) == 66, "wrong turbo4_0 block size");
 static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
 
+// TurboQuant 5-bit: 5-bit PolarQuant indices, lower 4 bits in qs[] (nibble packed),
+// upper 1 bit in signs[].  Per block: norm(fp16) + 64 + 16 bytes = 82 bytes per 128 values = 5.125 bpw
+#define QK_TURBO5 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected L2 norm
+    uint8_t    qs[QK_TURBO5 / 2];      // 64 bytes: lower 4-bit indices (nibble packed)
+    uint8_t    signs[QK_TURBO5 / 8];   // 16 bytes: upper 1-bit of 5-bit index (8 per byte)
+} block_turbo5_0;                       // 82 bytes total
+static_assert(sizeof(block_turbo5_0) == sizeof(ggml_half) + QK_TURBO5/2 + QK_TURBO5/8, "wrong turbo5_0 block size/padding");
+static_assert(QK_TURBO5 == 128, "turbo5 kernels assume QK_TURBO5 == 128");
+
+// TurboQuant Q_prod (arXiv 2504.19874, Sec. 2.2 / Algorithm 2): (b-1)-bit MSE-optimal
+// PolarQuant on the rotated coordinates + 1-bit QJL sign of the residual, which makes the
+// inner product (attention score) estimate unbiased. Reconstruction in the rotated domain:
+//     xhat_j = norm * (centroid[idx_j] + sign_j * TURBO_QJL_ALPHA * rnorm)
+// TURBO_QJL_ALPHA = sqrt(pi/2) / sqrt(128) makes <q, xhat> unbiased for <q, x> (paper Eq. for
+// QJL dequant, with the sign sketch taken in the WHT domain instead of a second dense matrix).
+// TURBO_QJL_ALPHA_MSE = sqrt(2/pi) / sqrt(128) is the alternative that minimizes MSE instead.
+//
+// To switch every codec/dequant (CPU + CUDA + FA) to the MSE-optimal scale, uncomment the
+// TURBO_QJL_MSE_OPTIMAL define below and rebuild ggml AND ggml-cuda together - the constant is
+// compiled in, so CPU and GPU must use the same one. Measured on this fork (2026-10-31 A/B):
+// with the unbiased alpha the Q_prod types are WORSE than the norm-corrected MSE types on
+// Wikitext-2 PPL (q5_1-turbo3q +4.12% vs q5_1-turbo3 +1.24%); the MSE alpha cuts the added QJL
+// noise energy 1.571 -> 0.637 (calibrated rel coord RMSE 0.249->0.199 / 0.133->0.106) but grows
+// the q=k shrinkage (0.956->0.931 / 0.986->0.979).
+// PPL A/B conclusion (2026-10-31, EXPERIMENT CLOSED): the MSE alpha helps only the 4-bit Q_prod
+// (q5_1-turbo4q 5.0755->5.0651, -0.20%; turbo4q-turbo4q -0.09%) and HURTS the 3-bit one
+// (q5_1-turbo3q 5.2492->5.3441, +1.81%). Both Q_prod types stay dominated by plain turbo4/5 at
+// equal budget, so the toggle remains OFF (unbiased alpha is the committed default).
+//#define TURBO_QJL_MSE_OPTIMAL
+#ifdef TURBO_QJL_MSE_OPTIMAL
+#define TURBO_QJL_ALPHA     0.07052369794346953f   // sqrt(2/pi)/sqrt(128) - minimal MSE
+#else
+#define TURBO_QJL_ALPHA     0.11077836568159473f   // sqrt(pi/2)/sqrt(128) - unbiased inner product
+#endif
+#define TURBO_QJL_ALPHA_MSE 0.07052369794346953f   // sqrt(2/pi)/sqrt(128) - minimal MSE
+
+// TurboQuant 3-bit Q_prod: 2-bit PolarQuant codebook + 1-bit QJL residual sign.
+// Per block: norm(fp16) + rnorm(fp16) + 32 B indices + 16 B signs = 52 bytes per 128 values = 3.25 bpw
+#define QK_TURBO3Q 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: ||x|| of the group (not rescaled: QJL is unbiased)
+    ggml_half  rnorm;                   //  2 bytes: ||residual|| in the normalized + WHT-rotated domain
+    uint8_t    qs[QK_TURBO3Q / 4];     // 32 bytes: 2-bit PolarQuant indices (4 per byte)
+    uint8_t    signs[QK_TURBO3Q / 8];   // 16 bytes: QJL sign of the residual (1 bit per element)
+} block_turbo3q_0;                      // 52 bytes total
+static_assert(sizeof(block_turbo3q_0) == 2*sizeof(ggml_half) + QK_TURBO3Q/4 + QK_TURBO3Q/8, "wrong turbo3q_0 block size/padding");
+static_assert(QK_TURBO3Q == 128, "turbo3q kernels assume QK_TURBO3Q == 128");
+
+// TurboQuant 4-bit Q_prod: 3-bit PolarQuant codebook + 1-bit QJL residual sign.
+// Index packing is identical to turbo3_0 (low 2 bits in qs[], high bit in hi1[]); the QJL sign
+// lives in its own 16 B array. Per block: 2 + 2 + 32 + 16 + 16 = 68 bytes per 128 values = 4.25 bpw
+#define QK_TURBO4Q 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: ||x|| of the group (not rescaled: QJL is unbiased)
+    ggml_half  rnorm;                   //  2 bytes: ||residual|| in the normalized + WHT-rotated domain
+    uint8_t    qs[QK_TURBO4Q / 4];     // 32 bytes: lower 2-bit indices (4 per byte)
+    uint8_t    hi1[QK_TURBO4Q / 8];    // 16 bytes: upper 1-bit of the 3-bit index (8 per byte)
+    uint8_t    signs[QK_TURBO4Q / 8];  // 16 bytes: QJL sign of the residual (1 bit per element)
+} block_turbo4q_0;                      // 68 bytes total
+static_assert(sizeof(block_turbo4q_0) == 2*sizeof(ggml_half) + QK_TURBO4Q/4 + 2*(QK_TURBO4Q/8), "wrong turbo4q_0 block size/padding");
+static_assert(QK_TURBO4Q == 128, "turbo4q kernels assume QK_TURBO4Q == 128");
+
+// ---- TurboQuant subtractive dither (optional, enabled with GGML_TURBO_DITHER) ----
+// arXiv 2605.13810: with a FIXED rotation (this fork's shared sign-seeded WHT) the scalar
+// codebook rounding error correlates with the data: coordinates that repeatedly land near a
+// codebook boundary pick up a systematic, query-correlated bias (Monte-Carlo on Qwen activations
+// showed this; dithering removes it). Quantization stores the centroid c of (y + u) and dequant
+// reconstructs (c - u), where u is a pseudo-random per-coordinate offset, uniform on
+// [-half_step, +half_step) and REGENERATED from the block id (no extra bytes stored):
+// the per-element error becomes uniform inside the cell and independent of the signal.
+// SCOPE: turbo3_0 + turbo4_0. Measured on this fork (2026-10-31 A/B at 16k ctx):
+//   V-side: turbo3 -0.47% (5.1040->5.0799); turbo4 +0.07%, turbo5 +0.15% (variance > removed bias).
+//   K-side: dithering K=turbo4 improved turbo4-turbo3 5.1245->5.1182 (-0.12%) - K error is
+//           amplified by softmax, removing its systematic bias pays (cf. arXiv 2605.08114).
+// set_rows cannot tell K from V roles, so turbo4 is dithered for both; this is a net win for
+// -ctk turbo4 usage and a small penalty only for -ctv turbo4 (not the production pair here).
+// turbo5 and Q_prod types (turbo3q/4q) and turbo2 are never dithered.
+// The dither seed is the linear 128-value block index in the cache tensor:
+//   - CUDA k_set_rows_turbo3: (dst_row*s1 + i02*s2 + i03*s3)/sizeof(block) + blk_in_row,
+//   - CUDA convert.cu dequantize kernels: their `ib` argument (same linear index),
+//   - CPU reference codec: block index b within the row (CPU is self-consistent only; a
+//     dithered cache must never be decoded through a different seed rule).
+// FA vector kernels apply the dither natively (vec_dot_fattn_vec_KQ_turbo4_0 and dequantize_V_turbo3_0/4_0
+// receive the row's linear block index as seed base), so turbo3_0 / turbo4_0 combos keep their native
+// vec kernels; fattn.cu no longer needs an f16 scratch fallback for them.
+#define TURBO_DITHER_STEP_3BIT 0.044243f   // narrowest 3-bit cell width, normalized centroid units
+#define TURBO_DITHER_STEP_4BIT 0.022824f   // narrowest 4-bit cell width
+
+#ifdef GGML_TURBO_DITHER
+#ifdef __CUDACC__
+#define GGML_TURBO_INLINE __device__ __forceinline__
+#else
+#define GGML_TURBO_INLINE static inline
+#endif
+
+#ifdef GGML_TURBO_DITHER_V1
+// A/B build (cmake GGML_TURBO_DITHER_V1=ON): v1 generator, one murmur3-finalizer hash and one
+// 24-bit sample PER COORDINATE (PPL refs ppl_results\20261031_142641). turbo_dither4 keeps the
+// group API but degenerates to four independent per-coordinate hashes, so all consumers share
+// one contract regardless of generator version.
+GGML_TURBO_INLINE float turbo_dither(uint32_t block_idx, int j, float step) {
+    uint32_t x = block_idx * 2654435761u + (uint32_t) j * 2246822519u + 0x9E3779B9u;
+    x ^= x >> 16; x *= 2246822519u; x ^= x >> 15; x *= 3266489917u; x ^= x >> 16;
+    // 24 mantissa bits are exact in fp32: (r - 0.5f) * step is identical on both compilers.
+    const float r = (float) (x >> 8) * (1.0f / 16777216.0f);
+    return (r - 0.5f) * step;
+}
+GGML_TURBO_INLINE void turbo_dither4(uint32_t block_idx, int w, float step, float * u) {
+    u[0] = turbo_dither(block_idx, 4*w + 0, step);
+    u[1] = turbo_dither(block_idx, 4*w + 1, step);
+    u[2] = turbo_dither(block_idx, 4*w + 2, step);
+    u[3] = turbo_dither(block_idx, 4*w + 3, step);
+}
+#else
+// Generator (2026-10-31 v2): ONE avalanche seed per GROUP OF FOUR consecutive coordinates
+// (w = j/4) feeds all four samples - the FA vec kernel's hot loop consumes K in exactly such
+// 4-coordinate words, so decode pays 4x fewer hashes. The avalanched seed goes through two
+// wide (64-bit) multiplies; each product's HIGH 32 bits are the best-mixed, and four 16-bit
+// lanes give the four samples. All-integer ops => bit-identical CPU/CUDA; lane*2^-16 is exact
+// in fp32, so (r - 0.5f) * step is identical on both compilers.
+// 16 random bits per coordinate puts u on a step/65536 grid - far below any centroid gap.
+// CONTRACT: u(block_idx, j) == lane (j % 4) of turbo_dither4(block_idx, j / 4) EVERYWHERE.
+// (v1 was a per-coordinate murmur3 finalizer with 24-bit samples; both versions are legal as
+// long as encoder and decoders use the same one - changing it re-baselines the PPL refs.)
+GGML_TURBO_INLINE void turbo_dither4(uint32_t block_idx, int w, float step, float * u) {
+    uint32_t x = block_idx * 2654435761u + (uint32_t) w * 2246822519u + 0x9E3779B9u;
+    x ^= x >> 16; x *= 2246822519u; x ^= x >> 15;
+    const uint32_t h0 = (uint32_t) (((uint64_t) x * 3266489917u) >> 32);
+    const uint32_t h1 = (uint32_t) (((uint64_t) x *  668265263u) >> 32);
+    u[0] = ((float) (h0 >> 16)        * (1.0f / 65536.0f) - 0.5f) * step;
+    u[1] = ((float) (h0 & 0xFFFFu)   * (1.0f / 65536.0f) - 0.5f) * step;
+    u[2] = ((float) (h1 >> 16)        * (1.0f / 65536.0f) - 0.5f) * step;
+    u[3] = ((float) (h1 & 0xFFFFu)   * (1.0f / 65536.0f) - 0.5f) * step;
+}
+
+// Scalar view over the same stream (cold paths, set_rows, CPU codec): same values as above.
+GGML_TURBO_INLINE float turbo_dither(uint32_t block_idx, int j, float step) {
+    float u[4];
+    turbo_dither4(block_idx, j / 4, step, u);
+    return u[j & 3];
+}
+#endif // GGML_TURBO_DITHER_V1
+#endif // GGML_TURBO_DITHER
+
 // 1.5625 bpw
 typedef struct {
     ggml_half d;

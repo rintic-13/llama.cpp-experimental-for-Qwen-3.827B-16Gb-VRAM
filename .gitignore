@@ -1,46 +1,33 @@
-﻿# Build outputs
-/build-*/
-/cmake-build-*/
-/out/
-/bin/
+﻿# build outputs
+build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
 *.obj
 *.pdb
 *.ilk
-*.lib
-*.exp
-*.dll
 *.exe
+*.dll
+*.lib
+*.a
+*.o
 
-# Local experimental test artifacts
-/tmp_sched_test/*.gguf
-/tmp_sched_test/*.bin
-/tmp_sched_test/*.safetensors
-/tmp_sched_test/*.pt
-/tmp_sched_test/*.pth
-/tmp_sched_test/archive/
+# experiment log dirs (referenced from NVFP4_FA_RESEARCH.md; kept on disk, not in VCS)
+fa_comp_*/
+fa_mma_ab_*/
+fa_f16v2_*/
+fa_vecab_*/
+decode_check_*/
+ppl_results/
 
-# Logs and profiling output
+# local models / datasets mirrors
+models/
+
+# misc
 *.log
-*.err
-*.prof
-
-# Local Visual Studio state
 .vs/
-
-# Local benchmark outputs
-gen_ab_*.txt
-
-# Python cache and temporary files
-__pycache__/
-*.py[cod]
-*.bak*
-*.out
-
-# Local scheduler experiments
-/tmp_sched_test/
-
-/tmp_sched_test/
-/build-x64-windows-msvc-release/
-
-tests/*.obj
-tests/*.exe
+.cache/
+compile_commands.json
+.pi/
+.gemini/
+*.tmp

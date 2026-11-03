@@ -103,7 +103,10 @@ static inline ggml_tensor * llama_mul_mat_signed_hadamard(
 static inline bool llama_cache_type_is_turbo(enum ggml_type type) {
     return type == GGML_TYPE_TURBO2_0
         || type == GGML_TYPE_TURBO3_0
-        || type == GGML_TYPE_TURBO4_0;
+        || type == GGML_TYPE_TURBO4_0
+        || type == GGML_TYPE_TURBO5_0
+        || type == GGML_TYPE_TURBO3Q_0
+        || type == GGML_TYPE_TURBO4Q_0;
 }
 
 // Prefetch the host pages needed to gather these rows.

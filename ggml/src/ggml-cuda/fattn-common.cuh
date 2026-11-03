@@ -42,8 +42,47 @@ typedef void (* fattn_kernel_t)(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
 
+// k_ibase is the linear quantization-block index of the K row inside the cache tensor, i.e.
+// (row byte offset) / block size - the same number k_set_rows_turbo3/4 hashed for the subtractive
+// dither (see the dither contract in ggml-common.h). Only the dithered turbo types need it.
 typedef float (*vec_dot_KQ_t)(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds,
+    const int64_t k_ibase);
+
+// v_ibase is the linear quantization-block index of the V row inside the cache tensor, same
+// contract as k_ibase above. Only dequantize_V_turbo3_0 / _turbo4_0 consume it.
+typedef void (*dequantize_V_t)(const void *, void *, const int64_t, const int64_t v_ibase);
+
+// Bytes per quantization block of a FA vector kernel KV type (F16 / BF16 have no blocks: the
+// seed value computed from 1-byte "blocks" is never consumed by those kernels).
+template <ggml_type type>
+static constexpr __device__ int64_t ggml_cuda_fattn_vec_block_bytes() {
+    if constexpr (type == GGML_TYPE_Q4_0) {
+        return sizeof(block_q4_0);
+    } else if constexpr (type == GGML_TYPE_Q4_1) {
+        return sizeof(block_q4_1);
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        return sizeof(block_q5_0);
+    } else if constexpr (type == GGML_TYPE_Q5_1) {
+        return sizeof(block_q5_1);
+    } else if constexpr (type == GGML_TYPE_Q8_0) {
+        return sizeof(block_q8_0);
+    } else if constexpr (type == GGML_TYPE_TURBO3_0) {
+        return sizeof(block_turbo3_0);
+    } else if constexpr (type == GGML_TYPE_TURBO4_0) {
+        return sizeof(block_turbo4_0);
+    } else if constexpr (type == GGML_TYPE_TURBO5_0) {
+        return sizeof(block_turbo5_0);
+    } else if constexpr (type == GGML_TYPE_TURBO3Q_0) {
+        return sizeof(block_turbo3q_0);
+    } else if constexpr (type == GGML_TYPE_TURBO4Q_0) {
+        return sizeof(block_turbo4q_0);
+    } else if constexpr (type == GGML_TYPE_NVFP4) {
+        return sizeof(block_nvfp4);
+    } else {
+        return 1;
+    }
+}
 
 struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t K;
@@ -87,7 +126,8 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
 
     const half2 * K_h2 = (const half2 *) K_c;
     GGML_UNUSED(Q_q8);
@@ -117,7 +157,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
 
     const nv_bfloat162 * K_bf16 = (const nv_bfloat162 *) K_c;
     GGML_UNUSED(Q_q8);
@@ -148,7 +189,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
 
     const block_q4_0 * K_q4_0 = (const block_q4_0 *) K_c;
     GGML_UNUSED(Q_v);
@@ -179,7 +221,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_1(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
 
     const block_q4_1 * K_q4_1 = (const block_q4_1 *) K_c;
     GGML_UNUSED(Q_v);
@@ -212,7 +255,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_1(
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
 
     const block_q5_0 * K_q5_0 = (const block_q5_0 *) K_c;
     GGML_UNUSED(Q_v);
@@ -257,7 +301,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_0(
 
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
 
     const block_q5_1 * K_q5_1 = (const block_q5_1 *) K_c;
     GGML_UNUSED(Q_v);
@@ -303,7 +348,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
 
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
 
     const block_q8_0 * K_q8_0 = (const block_q8_0 *) K_c;
     GGML_UNUSED(Q_v);
@@ -334,11 +380,15 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
 // i.e. the same values the f16 fallback dequantizes. Q is q8_1-quantized by the kernel:
 // q_i = Q_ds.x * qint_i + Q_ds.y/QK8_1 (group mean). Each thread applies the group mean to its own 4 K
 // values, so the QI8_1 words of a q8_1 group sum to mean * sum_group(K) exactly.
+// With GGML_TURBO_DITHER the blocks hold (centroid - u) reconstructions, u = turbo_dither(k_ibase + ib, j):
+// subtract u from the centroid before both the dot and the group-mean sum, exactly like convert.cu does.
 // Requires D % QK_TURBO4 == 0: a 128-element block does not fit in a 64-element row.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
-    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t k_ibase) {
     GGML_UNUSED(Q_v);
+    GGML_UNUSED(k_ibase);
 
     const block_turbo4_0 * K_turbo4_0 = (const block_turbo4_0 *) K_c;
 
@@ -365,10 +415,119 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
         const int8_t * q8 = (const int8_t *) &u;
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
 
+#ifdef GGML_TURBO_DITHER
+        const int64_t blk = k_ibase + ib;
+        // One group hash for the 4-coord word (j = 4*iqs4 + k, so w = j/4 = iqs4 exactly):
+        // 4x fewer hashes than the scalar stream - this is the FA decode hot path.
+        float du[4];
+        turbo_dither4((uint32_t) blk, iqs4, TURBO_DITHER_STEP_4BIT, du);
+        const float k0 = c0 - du[0];
+        const float k1 = c1 - du[1];
+        const float k2 = c2 - du[2];
+        const float k3 = c3 - du[3];
+
+        const float doti = q8[0]*k0 + q8[1]*k1 + q8[2]*k2 + q8[3]*k3;
+        const float sumc = k0 + k1 + k2 + k3;
+#else
         const float doti = q8[0]*c0 + q8[1]*c1 + q8[2]*c2 + q8[3]*c3;
         const float sumc = c0 + c1 + c2 + c3;
+#endif
 
         sum += norm * (Q_ds.x*doti + (Q_ds.y/QK8_1)*sumc);
+    }
+
+    return sum;
+}
+
+// ---- TurboQuant KQ dot for 5-bit (K in turbo5_0, Q in q8_0 / f16) ----
+// 5-bit index: low 4 bits in qs[] (nibble packed), high bit in signs[]
+// FIX 2026-10-31: the old loop advanced k_KQ as an ELEMENT index and used only q8[0] of each
+// q8_1 word, pairing Q coord 4*k_KQ with K coord k_KQ and covering only D/4 elements (garbage
+// scores in the decode/vec path; PPL never hit it because prefill uses the MMA_F16 kernel).
+// Now mirrors vec_dot_fattn_vec_KQ_turbo4_0 exactly: one 4-coord q8_1 word per thread/iteration.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
+    GGML_UNUSED(Q_v);
+
+    const block_turbo5_0 * K_turbo5_0 = (const block_turbo5_0 *) K_c;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib   = k_KQ / (QK_TURBO5/4);
+        const int iqs4 = k_KQ % (QK_TURBO5/4);
+
+        const float norm = __half2float(K_turbo5_0[ib].norm);
+
+        float c[4], sumc = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int j = 4*iqs4 + l;
+            const uint8_t lo  = (K_turbo5_0[ib].qs   [j / 2] >> ((j % 2) * 4)) & 0xF;
+            const uint8_t hi  = (K_turbo5_0[ib].signs[j / 8] >>  (j % 8))      & 0x1;
+            c[l] = TURBO_CENTROIDS_5BIT[lo | (hi << 4)] * norm;
+            sumc += c[l];
+        }
+
+        const int    u    = Q_q8[k_KQ_0/nthreads];
+        const int8_t * q8 = (const int8_t *) &u;
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+
+        const float doti = q8[0]*c[0] + q8[1]*c[1] + q8[2]*c[2] + q8[3]*c[3];
+
+        sum += Q_ds.x*doti + (Q_ds.y/QK8_1)*sumc;
+    }
+
+    return sum;
+}
+
+// ---- TurboQuant KQ dot for the 4-bit Q_prod type (K in turbo4q_0: 3-bit PolarQuant + QJL) ----
+// Reconstruction per element: norm * (centroid3[idx] + sign * TURBO_QJL_ALPHA * rnorm).
+// FIX 2026-10-31: same k_KQ/q8[0] indexing bug as turbo5_0 above, fixed the same way
+// (4 coords per q8_1 word, per vec_dot_fattn_vec_KQ_turbo4_0).
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4q_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
+    GGML_UNUSED(Q_v);
+
+    const block_turbo4q_0 * K_turbo4q = (const block_turbo4q_0 *) K_c;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib   = k_KQ / (QK_TURBO4Q/4);
+        const int iqs4 = k_KQ % (QK_TURBO4Q/4);
+
+        const float norm       = __half2float(K_turbo4q[ib].norm);
+        const float qjl_scale  = TURBO_QJL_ALPHA * __half2float(K_turbo4q[ib].rnorm);
+
+        float c[4], sumc = 0.0f;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int iq = 4*iqs4 + l;
+            const uint8_t lo  = (K_turbo4q[ib].qs   [iq / 4] >> ((iq % 4) * 2)) & 0x3;
+            const uint8_t hi  = (K_turbo4q[ib].hi1  [iq / 8] >>  (iq % 8))      & 0x1;
+            const uint8_t sgn = (K_turbo4q[ib].signs[iq / 8] >>  (iq % 8))      & 0x1;
+            c[l] = norm * (TURBO_CENTROIDS_3BIT[lo | (hi << 2)] + (sgn ? qjl_scale : -qjl_scale));
+            sumc += c[l];
+        }
+
+        const int    u    = Q_q8[k_KQ_0/nthreads];
+        const int8_t * q8 = (const int8_t *) &u;
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+
+        const float doti = q8[0]*c[0] + q8[1]*c[1] + q8[2]*c[2] + q8[3]*c[3];
+
+        sum += Q_ds.x*doti + (Q_ds.y/QK8_1)*sumc;
     }
 
     return sum;
@@ -418,10 +577,8 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
     }
 }
 
-typedef void (*dequantize_V_t)(const void *, void *, const int64_t);
-
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
     if constexpr (std::is_same_v<T, half>) {
         ggml_cuda_memcpy_1<ne*sizeof(half)>(dst, (const half *) vx + i0);
     } else if constexpr (std::is_same_v<T, float>) {
@@ -439,7 +596,7 @@ static __device__ __forceinline__ void dequantize_V_f16(const void * __restrict_
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
     static_assert(std::is_same_v<T, float>, "BF16 V dequantization only supports float output");
     static_assert(ne % 2 == 0, "bad ne");
     __align__(16) nv_bfloat162 tmp[ne/2];
@@ -452,7 +609,7 @@ static __device__ __forceinline__ void dequantize_V_bf16(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
     const block_q4_0 * x = (const block_q4_0 *) vx;
 
     const int64_t ib    =  i0          /  QK4_0;
@@ -496,7 +653,7 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
     const block_q4_1 * x = (const block_q4_1 *) vx;
 
     const int64_t ib    =  i0          /  QK4_1;
@@ -536,7 +693,7 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
     const block_q5_0 * x = (const block_q5_0 *) vx;
 
     const int64_t ib    =  i0          /  QK5_0;
@@ -586,7 +743,7 @@ static __device__ __forceinline__ void dequantize_V_q5_0(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
     const block_q5_1 * x = (const block_q5_1 *) vx;
 
     const int64_t ib    =  i0          /  QK5_1;
@@ -636,7 +793,7 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
 
     const int64_t ib  = i0 / QK8_0;
@@ -671,7 +828,7 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 // ---- TurboQuant V dequant for the FA vector kernel (values stay in the WHT-rotated domain) ----
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t v_ibase) {
     const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
 
     const int64_t ib = i0 / QK_TURBO4;
@@ -680,19 +837,36 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     static_assert(ne == 2 || ne == 4, "bad ne");
     const float norm = __half2float(x[ib].norm);
 
+#ifdef GGML_TURBO_DITHER
+    // ib is row-relative; the dither was hashed over the LINEAR block index in the cache tensor.
+    // Batched group hashes (1 per 4 coords) - FA decode hot path, see turbo_dither_range.
+    const uint32_t seed = (uint32_t) (v_ibase + ib);
+    float du[4];
+    turbo_dither_range(seed, j0, ne, TURBO_DITHER_STEP_4BIT, du);
+#endif
+
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
+#ifdef GGML_TURBO_DITHER
+            ((half2 *) dst)[l0/2] = make_half2(turbo4_dequant_element_u(x + ib, j0 + l0 + 0, norm, du[l0 + 0]),
+                                                turbo4_dequant_element_u(x + ib, j0 + l0 + 1, norm, du[l0 + 1]));
+#else
             ((half2 *) dst)[l0/2] = make_half2(turbo4_dequant_element(x + ib, j0 + l0 + 0, norm),
                                                 turbo4_dequant_element(x + ib, j0 + l0 + 1, norm));
+#endif
         }
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
+#ifdef GGML_TURBO_DITHER
+            ((float *) dst)[l] = turbo4_dequant_element_u(x + ib, j0 + l, norm, du[l]);
+#else
             ((float *) dst)[l] = turbo4_dequant_element(x + ib, j0 + l, norm);
+#endif
         }
     } else {
         static_assert(std::is_same_v<T, void>, "bad type");
@@ -700,11 +874,11 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
 }
 
 template <typename T, int ne>
-static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
-    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+static __device__ __forceinline__ void dequantize_V_turbo5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
+    const block_turbo5_0 * x = (const block_turbo5_0 *) vx;
 
-    const int64_t ib = i0 / QK_TURBO3;
-    const int     j0 = i0 % QK_TURBO3;
+    const int64_t ib = i0 / QK_TURBO5;
+    const int     j0 = i0 % QK_TURBO5;
 
     static_assert(ne == 2 || ne == 4, "bad ne");
     const float norm = __half2float(x[ib].norm);
@@ -713,15 +887,312 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __rest
     if constexpr (std::is_same_v<T, half>) {
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
-            ((half2 *) dst)[l0/2] = make_half2(turbo3_dequant_element(x + ib, j0 + l0 + 0, norm),
-                                                turbo3_dequant_element(x + ib, j0 + l0 + 1, norm));
+            ((half2 *) dst)[l0/2] = make_half2(turbo5_dequant_element(x + ib, j0 + l0 + 0, norm),
+                                                turbo5_dequant_element(x + ib, j0 + l0 + 1, norm));
         }
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = turbo5_dequant_element(x + ib, j0 + l, norm);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t v_ibase) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+
+    const int64_t ib = i0 / QK_TURBO3;
+    const int     j0 = i0 % QK_TURBO3;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    const float norm = __half2float(x[ib].norm);
+
+#ifdef GGML_TURBO_DITHER
+    // ib is row-relative; the dither was hashed over the LINEAR block index in the cache tensor.
+    // Batched group hashes (1 per 4 coords) - FA decode hot path, see turbo_dither_range.
+    const uint32_t seed = (uint32_t) (v_ibase + ib);
+    float du[4];
+    turbo_dither_range(seed, j0, ne, TURBO_DITHER_STEP_3BIT, du);
+#endif
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+#ifdef GGML_TURBO_DITHER
+            ((half2 *) dst)[l0/2] = make_half2(turbo3_dequant_element_u(x + ib, j0 + l0 + 0, norm, du[l0 + 0]),
+                                               turbo3_dequant_element_u(x + ib, j0 + l0 + 1, norm, du[l0 + 1]));
+#else
+            ((half2 *) dst)[l0/2] = make_half2(turbo3_dequant_element(x + ib, j0 + l0 + 0, norm),
+                                                turbo3_dequant_element(x + ib, j0 + l0 + 1, norm));
+#endif
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+#ifdef GGML_TURBO_DITHER
+            ((float *) dst)[l] = turbo3_dequant_element_u(x + ib, j0 + l, norm, du[l]);
+#else
             ((float *) dst)[l] = turbo3_dequant_element(x + ib, j0 + l, norm);
+#endif
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+// ---- V dequant for the Q_prod types (see ggml-common.h; 3-bit or 2-bit codebook + QJL sign) ----
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3q_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
+    const block_turbo3q_0 * x = (const block_turbo3q_0 *) vx;
+
+    const int64_t ib = i0 / QK_TURBO3Q;
+    const int     j0 = i0 % QK_TURBO3Q;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    const float norm = __half2float(x[ib].norm);
+    const float qjl_scale = TURBO_QJL_ALPHA * __half2float(x[ib].rnorm);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = make_half2(turbo3q_dequant_element(x + ib, j0 + l0 + 0, norm, qjl_scale),
+                                                turbo3q_dequant_element(x + ib, j0 + l0 + 1, norm, qjl_scale));
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = turbo3q_dequant_element(x + ib, j0 + l, norm, qjl_scale);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo4q_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
+    const block_turbo4q_0 * x = (const block_turbo4q_0 *) vx;
+
+    const int64_t ib = i0 / QK_TURBO4Q;
+    const int     j0 = i0 % QK_TURBO4Q;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    const float norm = __half2float(x[ib].norm);
+    const float qjl_scale = TURBO_QJL_ALPHA * __half2float(x[ib].rnorm);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = make_half2(turbo4q_dequant_element(x + ib, j0 + l0 + 0, norm, qjl_scale),
+                                                turbo4q_dequant_element(x + ib, j0 + l0 + 1, norm, qjl_scale));
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = turbo4q_dequant_element(x + ib, j0 + l, norm, qjl_scale);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
+// ---- NVFP4-like KV cache (Stage A, single-level: per-16 UE4M3 scale + packed E2M1 nibbles) ----
+// No dither, no rotation - the encoder writes plain (unrotated) rows, max/6 scale policy.
+// block_nvfp4 (64 elements): d[4] UE4M3 sub-block scales, qs[32] packed E2M1. Nibble code n:
+// value = kvalues_fp4[n] * d_sub  (kvalues_fp4 are doubled E2M1, d_sub is UE4M3 * 0.5).
+// K side of the vec kernel uses this scalar form; the fused KQ MMA path and dequantize_V_nvfp4
+// below use the PRMT register decoder (ggml_cuda_e2m1_pair_f16) instead.
+
+// E2M1 nibble pair -> packed half2 bits, table-free (magnitude high bytes 00,38,3C,3E,40,42,44,46
+// for values 0,.5,1,1.5,2,3,4,6 with always-zero f16 low byte; sign from nibble bit 3).  PRMT
+// avoids constant-cache serialization on divergent nibble indices (probe: 2-5x decode speedup).
+// Operands may be whole BYTES: only bits 0..3 (n0) / 0..3 (n1) are consumed, bit 3 = sign.
+// Bit-exact vs kvalues_fp4 LUT magnitudes: E2M1 x UE4M3 products have <= 6 significant mantissa
+// bits, exact in f16, so f16-domain results equal the f32 LUT path rounded to f16.
+static __device__ __forceinline__ uint32_t ggml_cuda_e2m1_pair_f16(const uint32_t n0, const uint32_t n1) {
+    const uint32_t tl = 0x3E3C3800u;   // T0..T3
+    const uint32_t th = 0x46444240u;   // T4..T7
+    const uint32_t sel = ((n0 & 7u) << 4) | ((n1 & 7u) << 12);
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(tl), "r"(th), "r"(sel));
+    return r | ((n0 & 8u) << 12) | ((n1 & 8u) << 28);
+}
+
+// NB: must NOT be guarded on GGML_USE_CUDA - that macro is only defined for the HOST side
+// (ggml-backend-reg.cpp), never inside the ggml-cuda CUDA-file compiles. __CUDACC__ is what
+// actually identifies nvcc kernel compilation here. (SASS forensics 2026-11-02: with the old
+// guard the DLL contained 0x E2M1 SASS opcodes; the "HW cvt" path had never been active.)
+#if defined(__CUDACC__) && !defined(GGML_USE_HIP) && defined(FP8_AVAILABLE) && CUDA_VERSION >= 12080 \
+    && !defined(GGML_CUDA_FORCE_E2M1_PRMT)
+#include <cuda_fp4.h>
+#define GGML_CUDA_E2M1_HW_CVT
+#endif
+
+// Packed e2m1 byte (low nibble = elem0, high nibble = elem1) -> packed half2 bits via the HW
+// cvt.rn.f16x2.e2m1x2 instruction (SM100+/SM120; the CUDA header emits it verbatim, PTX checked).
+// Bitwise-identical to ggml_cuda_e2m1_pair_f16 for every input (probe fa_nvfp4_cvt_probe:
+// 256/256 exact, incl. -0 for E2M1 code 8) but one instruction instead of ~5.
+static __device__ __forceinline__ uint32_t ggml_cuda_e2m1x2_f16(const uint32_t packed_byte) {
+#ifdef GGML_CUDA_E2M1_HW_CVT
+    const __half2_raw h = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t) (packed_byte & 0xFFu), __NV_E2M1);
+    return *reinterpret_cast<const uint32_t *>(&h);
+#else
+    return ggml_cuda_e2m1_pair_f16(packed_byte & 0xFu, (packed_byte >> 4) & 0xFu);
+#endif
+}
+
+// UE4M3 scale byte -> broadcast half2 holding the raw e4m3 value as f16.
+// The e4m3->f16 conversion is EXACT (all e4m3 values including subnormals are representable in
+// f16 without rounding), so this is bitwise-identical to the f32 path
+// __half2half2(__float2half(2.0f * ggml_cuda_ue4m3_to_fp32(b))) - note 2*ue4m3_to_fp32(b) == the
+// raw e4m3 value. The NaN->0 flush of ggml_cuda_ue4m3_to_fp32 is preserved explicitly.
+// dword arg: the 4 scale bytes of a block loaded as one u32, b = byte index 0..3.
+#if !defined(GGML_USE_HIP) && defined(FP8_AVAILABLE)
+#include <cuda_fp8.h>
+#endif
+static __device__ __forceinline__ half2 ggml_cuda_ue4m3_dword_h2(const uint32_t dwords, const int b) {
+#if !defined(GGML_USE_HIP) && defined(FP8_AVAILABLE)
+    uint32_t byte = (dwords >> (8*b)) & 0xFFu;
+    byte = ((byte & 0x7Fu) == 0x7Fu) ? 0u : byte;   // NaN -> 0, same as ue4m3_to_fp32
+    const uint32_t packed = byte | (byte << 8);     // e4m3x2 storage: both lanes the same byte
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) packed, __NV_E4M3);
+    return *reinterpret_cast<const half2 *>(&h);
+#else
+    return __half2half2(__float2half(2.0f * ggml_cuda_ue4m3_to_fp32((uint8_t) ((dwords >> (8*b)) & 0xFFu))));
+#endif
+}
+
+// Sub-block s of a 16-element group packs 8 bytes: qs[s*8 + c]  holds coord c (low nibble) and
+// coord c+8 (high nibble) of the group.
+// K dot layout: one 4-coord q8_1 word per thread/iteration (k_KQ), exactly like q5_1/q4_0:
+//   ib  = k_KQ / 16  (QK_NVFP4/4 words per 64-element block)
+//   iw  = k_KQ % 16  (word within block)
+//   sub = iw / 4     (4 words per sub-block)
+// The 4 coords of a word never cross a sub-block boundary (4-aligned within a 16-group), so one
+// scale is used per word. Bytes needed for the word: window qs[base + (iw&1)*4 .. +3], with
+// base = sub*8; low nibbles when (iw&2)==0, high nibbles otherwise.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const int64_t /* k_ibase */) {
+    GGML_UNUSED(Q_v);
+
+    const block_nvfp4 * K_nvfp4 = (const block_nvfp4 *) K_c;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib  = k_KQ / (QK_NVFP4/4);
+        const int iw  = k_KQ % (QK_NVFP4/4);
+
+        const int sub = iw >> 2;
+
+        const float d_sub = ggml_cuda_ue4m3_to_fp32(K_nvfp4[ib].d[sub]);
+
+        uint32_t b;
+        ggml_cuda_memcpy_1<sizeof(b)>(&b, K_nvfp4[ib].qs + sub*(QK_NVFP4_SUB/2) + (iw & 1)*4);
+
+        const int    u    = Q_q8[k_KQ_0/nthreads];
+        const int8_t * q8 = (const int8_t *) &u;
+        const float2 Q_ds  = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+
+        // code values only (kvalues_fp4 are doubled E2M1); the single UE4M3 scale of this
+        // sub-block factors out of both the dot and the group-mean term (turbo4 pattern):
+        // sum += d_sub * (Q_ds.x * sum(q8*code) + (Q_ds.y/QK8_1) * sum(code))
+        // Register decode instead of the kvalues_fp4 constant-LUT gather (divergent constant
+        // loads serialized the loop - probe fa_vec_ab_probe: nvfp4 KQ was ~1.6x q4_1 KQ):
+        //   u4 = table{0,1,2,3,4,6,8,12}[code&7] via one PRMT, sign applied with SIMD
+        //   mask/negate. All integers, so doti/sumc equal the old int8 expressions EXACTLY
+        //   (small exact sums), keeping this dot bitwise-identical (kvalues_fp4[8] = +0 maps
+        //   to -0 -> 0 under two's-complement negate, same value).
+        const int      sh  = (iw & 2) ? 4 : 0;
+        const uint32_t bs  = b >> sh;                                  // this word's nibbles at bits 0..3
+        const uint32_t sel = bs & 0x07070707u;                         // magnitude index per byte
+        const uint32_t sn4 = bs & 0x08080808u;                         // sign bit per byte
+        const uint32_t u4  = __byte_perm(0x03020100u, 0x0C080604u, sel); // magnitudes 0,1,2,3 | 4,6,8,12
+        const uint32_t m4  = __vcmpgts4((int) sn4, 0);                   // 0xFF where negative
+        const uint32_t v4  = __vsub4(u4 ^ m4, m4);                     // signed byte lanes = kv values
+
+        const uint32_t sc2 = __vadd4(v4, v4 >> 16);
+        const uint32_t sc4 = __vadd4(sc2, sc2 >> 8);
+        const int      sumc = (int) (int8_t) (sc4 & 0xFFu);
+
+        const float doti = (float) __dp4a(u, (int) v4, 0);
+
+        sum += d_sub*(Q_ds.x*doti + (Q_ds.y/QK8_1)*(float)sumc);
+    }
+
+    return sum;
+}
+
+// NVFP4 V dequant for the FA vector kernel. Each thread handles ne consecutive coordinates of a
+// V row; ne = 2 or 4 and the starting coordinate is 4-aligned, so a thread never crosses a
+// sub-block boundary.
+// (The old scalar kv_fp4_val LUT helper was replaced by the PRMT register decoder below -
+//  kvalues_fp4 divergent constant-cache loads were the nvfp4 V-side bottleneck.)
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
+    const block_nvfp4 * x = (const block_nvfp4 *) vx;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    const int64_t ib = i0 / QK_NVFP4;
+    const int     c0 = i0 % QK_NVFP4;
+
+    const int sub = c0 / QK_NVFP4_SUB;
+    const int   o = c0 % QK_NVFP4_SUB;   // 0,4 for ne=4; any 4-aligned for ne=2
+
+    // The ne coords of this call live in the low (o<8) or high (o>=8) nibbles of ne consecutive
+    // bytes.  One register load replaces ne byte loads; for the high nibbles a single word shift
+    // moves them to bits 0..3 of each byte (the garbage entering the upper nibbles is never read:
+    // ggml_cuda_e2m1_pair_f16 consumes bits 0..3 only, bit 3 = sign).
+    // Load width = ne bytes: ne=4 implies o%8 in {0,4}, ne=2 implies o%8 in {0,2,4,6}, so the
+    // window never crosses the 32-byte qs[] end of the block.
+    typedef std::conditional_t<(ne >= 4), uint32_t, uint16_t> nvfp4_word_t;
+    nvfp4_word_t w;
+    ggml_cuda_memcpy_1<sizeof(w)>(&w, x[ib].qs + sub*(QK_NVFP4_SUB/2) + (o & 7));
+    if (o >= 8) {
+        w >>= 4;
+    }
+
+    // 2.0f * UE4M3 = the raw scale byte as fp32; e2m1 x e4m3 products have <= 6 significant
+    // mantissa bits -> exact in f16, making this bit-identical to the old scalar LUT path
+    // ((float) kvalues_fp4[nib] * d_sub rounded to half), see the comment on e2m1_pair_f16.
+    const half2 sh = ggml_cuda_ue4m3_dword_h2(*(const uint32_t *) &x[ib].d[0], sub);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const uint32_t s = w >> (8*l0);
+            const uint32_t bits = ggml_cuda_e2m1x2_f16((s & 0x0Fu) | ((s >> 4) & 0xF0u));
+            ((half2 *) dst)[l0/2] = __hmul2(*reinterpret_cast<const half2 *>(&bits), sh);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const uint32_t s = w >> (8*l0);
+            const uint32_t bits = ggml_cuda_e2m1x2_f16((s & 0x0Fu) | ((s >> 4) & 0xF0u));
+            ((float2 *) dst)[l0/2] = __half22float2(__hmul2(*reinterpret_cast<const half2 *>(&bits), sh));
         }
     } else {
         static_assert(std::is_same_v<T, void>, "bad type");
@@ -744,6 +1215,12 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO5_0) {
+        return vec_dot_fattn_vec_KQ_turbo5_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO4Q_0) {
+        return vec_dot_fattn_vec_KQ_turbo4q_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_NVFP4) {
+        return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else {
@@ -768,8 +1245,16 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO5_0) {
+        return dequantize_V_turbo5_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
         return dequantize_V_turbo3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3Q_0) {
+        return dequantize_V_turbo3q_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO4Q_0) {
+        return dequantize_V_turbo4q_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_NVFP4) {
+        return dequantize_V_nvfp4<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else {

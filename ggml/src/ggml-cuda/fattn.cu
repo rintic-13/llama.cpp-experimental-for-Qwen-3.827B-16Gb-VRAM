@@ -432,8 +432,40 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// A/B switches (both read the very same cache bits, so they are reference implementations for
+// each other and their tg speed is measurable with llama-bench in one and the same build):
+//   GGML_CUDA_FATTN_VEC_FALLBACK=1 - force the f16 scratch path (convert.cu dequant + MMA_F16)
+//                                    for ALL dithered turbo combos (the pre-2026-10-31 gate).
+//   GGML_CUDA_FATTN_VEC_NATIVE=1   - force native vec kernels for ALL combos (skip the speed gate).
+static bool ggml_cuda_fattn_vec_fallback_forced() {
+    static const bool val = getenv("GGML_CUDA_FATTN_VEC_FALLBACK") != nullptr;
+    return val;
+}
+static bool ggml_cuda_fattn_vec_native_forced() {
+    static const bool val = getenv("GGML_CUDA_FATTN_VEC_NATIVE") != nullptr;
+    return val;
+}
+
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
+// With GGML_TURBO_DITHER the vec kernels apply the subtractive dither themselves (vec_dot_fattn_vec_KQ_turbo4_0,
+// dequantize_V_turbo3_0/4_0 take the row's linear block index for the dither seed), so routing is a PURE
+// SPEED choice. Measured with llama-bench tg at 8k KV depth on RTX 5060 Ti (2026-10-31): native vec is on
+// par with the f16-scratch MMA path for V=turbo3 (+0.2%), but its scalar dot / in-register dequant for
+// turbo4 K or V loses 6-15%, so turbo4 combos default to the MMA kernel. Gate inactive in dither-OFF
+// builds (those keep the historical all-native routing, bit-identical decode to old baselines).
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K, const ggml_type type_V) {
+#ifdef GGML_TURBO_DITHER
+    if (!ggml_cuda_fattn_vec_native_forced()) {
+        if (ggml_cuda_fattn_vec_fallback_forced()) {
+            if (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_NVFP4 ||
+                type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_NVFP4) {
+                return nullptr;
+            }
+        } else if (type_K == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4_0) {
+            return nullptr;
+        }
+    }
+#endif
     FATTN_VEC_CASES_ALL_D(F16,  F16)
     FATTN_VEC_CASES_ALL_D(Q4_0, F16)
     FATTN_VEC_CASES_ALL_D(Q4_1, F16)
@@ -493,10 +525,40 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     // TurboQuant KV cache: K stays q5_1 (GQA 6:1 makes K quality dominant), V is quantized.
     FATTN_VEC_CASES_ALL_D(Q5_1, TURBO4_0)
     FATTN_VEC_CASES_ALL_D(Q5_1, TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(Q5_1, TURBO5_0)
 
     // K = turbo4_0, V = turbo3_0: native QK^T dot over the 4-bit centroids, no 64 case (QK_TURBO4 = 128).
     FATTN_VEC_CASE(128, TURBO4_0, TURBO3_0)
     FATTN_VEC_CASE(256, TURBO4_0, TURBO3_0)
+
+    // K = turbo5_0, V = turbo3/turbo4/turbo5: native QK^T dot over the 5-bit centroids.
+    FATTN_VEC_CASE(128, TURBO5_0, TURBO3_0)
+    FATTN_VEC_CASE(256, TURBO5_0, TURBO3_0)
+    FATTN_VEC_CASE(128, TURBO5_0, TURBO4_0)
+    FATTN_VEC_CASE(256, TURBO5_0, TURBO4_0)
+    FATTN_VEC_CASE(128, TURBO5_0, TURBO5_0)
+    FATTN_VEC_CASE(256, TURBO5_0, TURBO5_0)
+
+    // Q_prod types (MSE + 1-bit QJL residual sign). K=turbo4q has a native vec_dot over the
+    // 3-bit centroids + QJL sign; turbo3q is V-only (like turbo3_0, no K vec_dot). No 64 cases
+    // for the turbo4q K combos: QK_TURBO4Q = 128 does not fit a 64-element row.
+    FATTN_VEC_CASES_ALL_D(Q5_1, TURBO4Q_0)
+    FATTN_VEC_CASES_ALL_D(Q5_1, TURBO3Q_0)
+
+    FATTN_VEC_CASE(128, TURBO4Q_0, TURBO4_0)
+    FATTN_VEC_CASE(256, TURBO4Q_0, TURBO4_0)
+    FATTN_VEC_CASE(128, TURBO4Q_0, TURBO4Q_0)
+    FATTN_VEC_CASE(256, TURBO4Q_0, TURBO4Q_0)
+    FATTN_VEC_CASE(128, TURBO4_0, TURBO3Q_0)
+    FATTN_VEC_CASE(256, TURBO4_0, TURBO3Q_0)
+    FATTN_VEC_CASE(128, TURBO4_0, TURBO4_0)
+    FATTN_VEC_CASE(256, TURBO4_0, TURBO4_0)
+
+    // NVFP4-like KV cache (Stage A): single-level NVFP4 (per-16 UE4M3 + E2M1), unrotated, no dither.
+    // The turbo4 speed gate above deliberately does NOT touch NVFP4: it routes to the vec kernel.
+    FATTN_VEC_CASES_ALL_D(NVFP4, NVFP4)
+    FATTN_VEC_CASES_ALL_D(Q5_1,  NVFP4)
+    FATTN_VEC_CASES_ALL_D(F16,   NVFP4)
 
     return nullptr;
 }
@@ -542,6 +604,10 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO5_0:
+        case GGML_TYPE_TURBO3Q_0:
+        case GGML_TYPE_TURBO4Q_0:
+        case GGML_TYPE_NVFP4:
             return true;
         default:
             return false;
@@ -767,7 +833,57 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+
+    // Positive routing proof (opt-in, GGML_FATTN_DEBUG=1): log once per distinct
+    // (kernel, K/V quantization, vec-instance availability, decode/prefill) signature.
+    // Answers "did this pair really run the fused FA vector kernel or the f16 scratch MMA path?".
+    static const bool fattn_debug = getenv("GGML_FATTN_DEBUG") != nullptr;
+    if (fattn_debug) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const char * kname = kernel == BEST_FATTN_KERNEL_VEC    ? "vec"
+                           : kernel == BEST_FATTN_KERNEL_MMA_F16 ? "mma_f16"
+                           : kernel == BEST_FATTN_KERNEL_TILE    ? "tile" : "none";
+        const bool qc_k = ggml_is_quantized(K->type);
+        const bool qc_v = ggml_is_quantized(V->type);
+        const bool vec_compiled = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr;
+        const bool decode = Q->ne[1] == 1;
+        const unsigned sig = (unsigned) kernel * 32u + (unsigned) qc_k * 16u + (unsigned) qc_v * 8u +
+                             (unsigned) vec_compiled * 4u + (unsigned) decode * 2u + (unsigned) (Q->ne[0] == 256);
+        static uint64_t sig_seen = 0;
+        if (!(sig_seen & (1ull << (sig % 64)))) {
+            sig_seen |= 1ull << (sig % 64);
+            GGML_LOG_WARN("FATTN_DEBUG: kernel=%s K=%s V=%s D=%d nq=%d gqa=%d vec_compiled=%d\n",
+                kname, ggml_type_name(K->type), ggml_type_name(V->type), (int) Q->ne[0], (int) Q->ne[1],
+                K->ne[2] ? (int) (Q->ne[2] / K->ne[2]) : 0, (int) vec_compiled);
+        }
+    }
+
+    // One-shot Q activation dump for offline codec studies (GGML_CUDA_FATTN_QDUMP=<path>).
+    // Off by default; appends up to 8 FA calls (first head, one row per token, D fp32 each).
+    // Note: llama's warmup run consumes slots - pass --no-warmup to the tool.
+    // Read-only side channel: no effect on numerics or routing.
+    static const char * qdump_path = getenv("GGML_CUDA_FATTN_QDUMP");
+    static int qdump_calls = 0;
+    if (qdump_path && qdump_calls < 8 && kernel != BEST_FATTN_KERNEL_NONE) {
+        const ggml_tensor * Q = dst->src[0];
+        const int qd = (int) Q->ne[0];
+        const int nrows = (int) std::min(Q->ne[1], (int64_t) 1024);
+        std::vector<float> hq((size_t) qd * nrows);
+        if (cudaMemcpy2D(hq.data(), qd * 4, Q->data, Q->nb[1], qd * 4, nrows, cudaMemcpyDeviceToHost) == cudaSuccess) {
+            FILE * f = fopen(qdump_path, "ab");
+            if (f) {
+                fwrite(hq.data(), 4, (size_t) qd * nrows, f);
+                fclose(f);
+                ++qdump_calls;
+                GGML_LOG_WARN("FATTN_QDUMP: wrote %d rows x %d fp32 (head 0) to %s\n", nrows, qd, qdump_path);
+            }
+        }
+    }
+
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

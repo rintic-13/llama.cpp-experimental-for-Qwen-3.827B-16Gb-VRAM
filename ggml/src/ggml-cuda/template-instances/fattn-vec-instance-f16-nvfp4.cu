@@ -1,0 +1,7 @@
+// NVFP4-like KV cache (Stage A): -ctk f16 -ctv nvfp4 (f16 K reference pairing).
+
+#include "../fattn-vec.cuh"
+
+DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_NVFP4);
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_NVFP4);
+DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_NVFP4);

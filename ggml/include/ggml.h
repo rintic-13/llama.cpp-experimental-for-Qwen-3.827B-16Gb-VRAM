@@ -433,7 +433,10 @@ extern "C" {
         GGML_TYPE_TURBO2_0  = 44, // TurboQuant KV cache 2-bit: WHT(group 128) + 2-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_TURBO3_0  = 45, // TurboQuant KV cache 3-bit: WHT + 3-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_TURBO4_0  = 46, // TurboQuant KV cache 4-bit: WHT + 4-bit PolarQuant, no QJL (runtime-only KV type)
-        GGML_TYPE_COUNT   = 47,
+        GGML_TYPE_TURBO5_0  = 47, // TurboQuant KV cache 5-bit: WHT + 5-bit PolarQuant, no QJL (runtime-only KV type)
+        GGML_TYPE_TURBO3Q_0 = 48, // TurboQuant KV cache 3-bit Q_prod: 2-bit PolarQuant + 1-bit QJL residual sign (runtime-only KV type)
+        GGML_TYPE_TURBO4Q_0 = 49, // TurboQuant KV cache 4-bit Q_prod: 3-bit PolarQuant + 1-bit QJL residual sign (runtime-only KV type)
+        GGML_TYPE_COUNT   = 50,
     };
 
     // [TAG_GGML_PREC]

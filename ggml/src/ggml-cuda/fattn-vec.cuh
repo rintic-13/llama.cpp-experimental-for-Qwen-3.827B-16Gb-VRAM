@@ -1,5 +1,107 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "mma.cuh"
+
+// Hardware FP4 KQ^T in the vec kernel (GGML_CUDA_FATTN_VEC_KQ_MMA=1, NVFP4 K only):
+// computes QK^T with mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64
+// instead of the integer dot. m-side = 16 K-token rows read straight from the block_nvfp4 cache
+// bytes (nibble repack at load), n-side = up to 8 query rows requantized to nvfp4 in smem.
+// Q uses a residual split: Q = Q_hi + Q_lo, both nvfp4 (own scales), two mma chains accumulating
+// into the same f32 tile - this removes ~10x of the E2M1 Q error incl. saturation clipping.
+// See NVFP4_FA_RESEARCH.md for the fragment / scale-lane layout and the numerical rationale.
+static bool ggml_cuda_fattn_vec_kq_mma_enabled() {
+    static const bool val = getenv("GGML_CUDA_FATTN_VEC_KQ_MMA") != nullptr;
+    return val;
+}
+
+// Fused f16 KQ^T in the vec kernel (GGML_CUDA_FATTN_VEC_KQ_MMA_F16=1, NVFP4 K only):
+// K is read as unmodified block_nvfp4 cache bytes and decoded E2M1+UE4M3 -> f16 fragment words
+// directly in registers (the m16n8k16 map is lane-aligned, so no smem staging and no f16 KV is
+// ever written to global memory), Q is converted f32 -> f16 with no quantization and kept in
+// per-lane fragment registers, and a dense m16n8k16 f32-accum mma computes KQ^T (m = 16 K
+// tokens, n = up to 8 query rows).  Probe-validated numerics: K stays codec-exact, Q error is
+// f16 rounding only (score rms 3e-6 against the f16 reference; see NVFP4_FA_RESEARCH.md SS10).
+// Takes precedence over GGML_CUDA_FATTN_VEC_KQ_MMA when both are set.
+// DEFAULT ON since 2026-11-02: the fused decode+mma KQ met the speed gate against the q4_1
+// integer-dot etalon (+0.2% @8K / +0.1% @32K, fa_comp_20261102_010329) with probe-proven
+// bit-exact decoders, so it adds no numeric risk vs the dot path. Set
+// GGML_CUDA_FATTN_VEC_KQ_MMA_F16=0 to fall back to the integer dp4a dot (A/B, debugging).
+static bool ggml_cuda_fattn_vec_kq_mma_f16_enabled() {
+    static const bool val = [] (const char * v) {
+        return v == nullptr || (v[0] != '0' && v[0] != '\0');
+    }(getenv("GGML_CUDA_FATTN_VEC_KQ_MMA_F16"));
+    return val;
+}
+
+// UE4M3 encode matching ggml_fp32_to_ue4m3 (used to requantize Q rows for the FP4 mma).
+static __device__ __forceinline__ uint8_t ggml_cuda_ue4m3_from_fp32(float x) {
+    if (!(x > 0.0f)) return 0;
+    if (x > 448.0f) x = 448.0f;
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    const int fp32_exp = (int) ((bits >> 23) & 0xFF) - 127;
+    const int fp32_man = (int) ((bits >> 20) & 0x7);
+    int ue_exp = fp32_exp + 7;
+    if (ue_exp <= 0) {
+        int man = (int) (x * 512.0f + 0.5f);
+        if (man > 7) man = 7;
+        if (man < 1) return 0;
+        return (uint8_t) man;
+    }
+    if (ue_exp >= 15) return 0x7E;
+    const int round_bit = (int) ((bits >> 19) & 1);
+    int ue_man = fp32_man + round_bit;
+    if (ue_man > 7) {
+        ue_man = 0;
+        ue_exp++;
+        if (ue_exp >= 15) return 0x7E;
+    }
+    return (uint8_t) ((ue_exp << 3) | ue_man);
+}
+
+// Nearest E2M1 code for v with hw scale dd (value = E2M1 * dd). The midpoints of the E2M1 grid
+// times a 4-bit UE4M3 mantissa are exact in fp32, so these comparisons pick the same code as a
+// linear scan over all 16 codes with strict '<' (ties go to the smaller magnitude, -0 stays 0).
+static __device__ __forceinline__ uint32_t ggml_cuda_e2m1_code(float v, float dd) {
+    const float a = fabsf(v);
+    if (!(a > 0.0f) || !(dd > 0.0f) || a < 0.25f * dd) return 0;
+    const uint32_t m =
+        (a < 0.75f * dd) ? 1u :
+        (a < 1.25f * dd) ? 2u :
+        (a < 1.75f * dd) ? 3u :
+        (a < 2.50f * dd) ? 4u :
+        (a < 3.50f * dd) ? 5u :
+        (a < 5.00f * dd) ? 6u : 7u;
+    return (v < 0.0f) ? (m + 8u) : m;
+}
+
+// E2M1 dequant for the residual (Q_lo) pass: magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6, sign bit 3
+// (identical set to the probe's kvalues_fp4/2 table used by the host reference).
+static __device__ __forceinline__ float ggml_cuda_e2m1_value(const uint32_t code) {
+    const uint32_t m = code & 7u;
+    const float mag = (m < 4u) ? ldexpf((float) m, -1)
+                               : (m == 4u ? 2.0f : (m == 5u ? 3.0f : (m == 6u ? 4.0f : 6.0f)));
+    return (code & 8u) ? -mag : mag;
+}
+
+// One ggml block_nvfp4 8-byte group (coords packed as (c, c+8) per byte) -> two
+// consecutive-pair words as the tensor core expects (byte i = coords 2i, 2i+1).
+static __device__ __forceinline__ void ggml_cuda_fp4_repack_pair(uint32_t W0, uint32_t W1, uint32_t & N0, uint32_t & N1) {
+    const uint32_t M0 = W0 & 0x0F0F0F0Fu, M1 = W1 & 0x0F0F0F0Fu;
+    const uint32_t X  = __byte_perm(M0, M1, 0x6420);
+    const uint32_t Y  = __byte_perm(M0, M1, 0x7531);
+    N0 = X | (Y << 4);
+    const uint32_t H0 = (W0 >> 4) & 0x0F0F0F0Fu, H1 = (W1 >> 4) & 0x0F0F0F0Fu;
+    const uint32_t Xh = __byte_perm(H0, H1, 0x6420);
+    const uint32_t Yh = __byte_perm(H0, H1, 0x7531);
+    N1 = Xh | (Yh << 4);
+}
+
+// E2M1 nibble pair -> packed half2 bits: see ggml_cuda_e2m1_pair_f16 in fattn-common.cuh
+// (moved there when dequantize_V_nvfp4 started using it too; PRMT-based, table-free, bit-exact).
+// On CUDA >= 12.8 the HW cvt.rn.f16x2.e2m1x2 path (ggml_cuda_e2m1x2_f16) is used instead where
+// the data already sits as packed nibble pairs; bitwise-identical to the PRMT path (probe
+// tools/fa_nvfp4_cvt_probe.cu: exact on all 256 pair encodings, including -0 for code 8).
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -16,7 +118,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool KQ_mma = false, bool KQ_f16dq = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -110,6 +212,16 @@ static __global__ void flash_attn_ext_vec(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
+    // Subtractive dither seed base (see the dither contract in ggml-common.h): k_set_rows_turbo3/4
+    // hashed the LINEAR quantization-block index of the block inside the cache tensor. The vec
+    // kernels walk K/V as base pointer + strides, so turn the row's byte offset into that block
+    // index here; the division is exact because the row strides are whole blocks.
+    // Non-turbo types ignore the value (their block size only makes the arithmetic well-defined).
+    constexpr int64_t k_blk_bytes = ggml_cuda_fattn_vec_block_bytes<type_K>();
+    constexpr int64_t v_blk_bytes = ggml_cuda_fattn_vec_block_bytes<type_V>();
+    const int64_t k_blk_per_row = (int64_t) nb11 / k_blk_bytes;
+    const int64_t v_blk_per_row = (int64_t) nb21 / v_blk_bytes;
+
     const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
@@ -129,6 +241,18 @@ static __global__ void flash_attn_ext_vec(
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 #endif // V_DOT2_F32_F16_AVAILABLE
 
+    // FP4 mma staging tiles in fragment-native word order, sized 1 when unused.
+    // F4_STR = code words per row (+1 to break bank alignment), F4_raw holds the fp32 scores
+    // before softmax; KQ itself may be half on some arches so it cannot hold the raw scores.
+    constexpr int F4_STR = D/8 + 1;
+    __shared__ int  F4_Qnc[KQ_mma ?  8*F4_STR      : 1];
+    __shared__ int  F4_Qsc[KQ_mma ?  8*(D/64)      : 1];
+    __shared__ int  F4_Qnc2[KQ_mma ?  8*F4_STR     : 1];  // residual-split (Q_lo) operands
+    __shared__ int  F4_Qsc2[KQ_mma ?  8*(D/64)     : 1];
+    __shared__ int  F4_Knc[KQ_mma ? 32*F4_STR      : 1];
+    __shared__ int  F4_Ksc[KQ_mma ? 32*(D/64)      : 1];
+    __shared__ float F4_raw[(KQ_mma || KQ_f16dq) ? ncols*nthreads : 1];
+
     float KQ_max[ncols];
     float KQ_sum[ncols];
 #pragma unroll
@@ -147,7 +271,89 @@ static __global__ void flash_attn_ext_vec(
     float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
 
     ggml_cuda_pdl_sync();
-    if constexpr (Q_q8_1) {
+    // KQ_f16dq needs no prep: Q fragment words are built per-lane inside the KQ block below
+    // (the m16n8k16 map is lane-aligned, see NVFP4_FA_RESEARCH.md SS10e).
+    if constexpr (KQ_mma) {
+        // Requantize up to 8 Q rows to nvfp4 in smem, fragment-native order, one sub-block per lane.
+        constexpr int F4_NSUB  = D / QK_NVFP4_SUB;
+        constexpr int F4_RPP   = WARP_SIZE / F4_NSUB; // rows per warp per pass
+        const int l  = threadIdx.x % F4_NSUB;
+        const int rr = threadIdx.x / F4_NSUB;
+        for (int j0 = 0; j0 < 8; j0 += nwarps*F4_RPP) {
+            const int j = j0 + threadIdx.y*F4_RPP + rr;
+
+            if (j >= 8) {
+                break;
+            }
+
+            const bool   active = (j < ncols) && (ncols == 1 || ic0 + j < int(ne01.z));
+            const float * Q_f   = (const float *) (Q + j*nb01);
+
+            float v[QK_NVFP4_SUB];
+            float amax = 0.0f;
+#pragma unroll
+            for (int c = 0; c < QK_NVFP4_SUB; ++c) {
+                v[c] = active ? Q_f[l*QK_NVFP4_SUB + c] : 0.0f;
+                amax = fmaxf(amax, fabsf(v[c]));
+            }
+            const uint8_t ue = ggml_cuda_ue4m3_from_fp32(amax / 6.0f);
+            const float   dd = 2.0f * ggml_cuda_ue4m3_to_fp32(ue); // matches the hw scale byte, exact doubling
+
+            uint32_t cd[QK_NVFP4_SUB];
+            uint32_t N0 = 0, N1 = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                cd[2*b + 0] = ggml_cuda_e2m1_code(v[2*b + 0], dd);
+                cd[2*b + 1] = ggml_cuda_e2m1_code(v[2*b + 1], dd);
+                cd[2*b + 8] = ggml_cuda_e2m1_code(v[2*b + 8], dd);
+                cd[2*b + 9] = ggml_cuda_e2m1_code(v[2*b + 9], dd);
+                N0 |= (uint32_t) (cd[2*b + 0] | (cd[2*b + 1] << 4)) << (8*b);
+                N1 |= (uint32_t) (cd[2*b + 8] | (cd[2*b + 9] << 4)) << (8*b);
+            }
+            F4_Qnc[j*F4_STR + 2*l]     = (int) N0;
+            F4_Qnc[j*F4_STR + 2*l + 1] = (int) N1;
+
+            uint32_t u = ue;
+            u |= __shfl_sync(0xFFFFFFFFu, ue, threadIdx.x + 1, WARP_SIZE) << 8;
+            u |= __shfl_sync(0xFFFFFFFFu, ue, threadIdx.x + 2, WARP_SIZE) << 16;
+            u |= __shfl_sync(0xFFFFFFFFu, ue, threadIdx.x + 3, WARP_SIZE) << 24;
+            if ((l & 3) == 0) {
+                F4_Qsc[j*(D/64) + (l >> 2)] = (int) u;
+            }
+
+            // Residual split Q_lo = nvfp4(Q - dequant(Q_hi)) with its own block scales, same
+            // closed-form codec as the hi pass. Removes ~10x of the E2M1 Q error (incl. the
+            // saturation-clipped coords); quantized exactly like the host reference in the
+            // probe's --mode residual study (NVFP4_FA_RESEARCH.md §8).
+            float rv[QK_NVFP4_SUB];
+            float amax_r = 0.0f;
+#pragma unroll
+            for (int c = 0; c < QK_NVFP4_SUB; ++c) {
+                rv[c] = v[c] - dd * ggml_cuda_e2m1_value(cd[c]);
+                amax_r = fmaxf(amax_r, fabsf(rv[c]));
+            }
+            const uint8_t ue2 = ggml_cuda_ue4m3_from_fp32(amax_r / 6.0f);
+            const float   dd2 = 2.0f * ggml_cuda_ue4m3_to_fp32(ue2);
+
+            uint32_t M0 = 0, M1 = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                M0 |= (uint32_t) (ggml_cuda_e2m1_code(rv[2*b + 0], dd2) | (ggml_cuda_e2m1_code(rv[2*b + 1], dd2) << 4)) << (8*b);
+                M1 |= (uint32_t) (ggml_cuda_e2m1_code(rv[2*b + 8], dd2) | (ggml_cuda_e2m1_code(rv[2*b + 9], dd2) << 4)) << (8*b);
+            }
+            F4_Qnc2[j*F4_STR + 2*l]     = (int) M0;
+            F4_Qnc2[j*F4_STR + 2*l + 1] = (int) M1;
+
+            uint32_t u2 = ue2;
+            u2 |= __shfl_sync(0xFFFFFFFFu, ue2, threadIdx.x + 1, WARP_SIZE) << 8;
+            u2 |= __shfl_sync(0xFFFFFFFFu, ue2, threadIdx.x + 2, WARP_SIZE) << 16;
+            u2 |= __shfl_sync(0xFFFFFFFFu, ue2, threadIdx.x + 3, WARP_SIZE) << 24;
+            if ((l & 3) == 0) {
+                F4_Qsc2[j*(D/64) + (l >> 2)] = (int) u2;
+            }
+        }
+        __syncthreads();
+    } else if constexpr (Q_q8_1) {
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
@@ -258,34 +464,205 @@ static __global__ void flash_attn_ext_vec(
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 
+        // First block of this K tile inside the cache tensor (dither seed base, see ggml-common.h):
+        const int64_t k_tile_ibase = (K - K_ptr) / k_blk_bytes;
+
         float KQ_max_new[ncols];
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
             KQ_max_new[j] = KQ_max[j];
         }
 
+        if constexpr (!KQ_mma && !KQ_f16dq) {
 #pragma unroll
-        for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
-            const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+            for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
+                const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], k_tile_ibase + (int64_t) i_KQ*k_blk_per_row);
+                    sum = warp_reduce_sum<nthreads_KQ>(sum);
+
+                    if (use_logit_softcap) {
+                        sum = logit_softcap*tanhf(sum);
+                    }
+
+                    if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                        sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    }
+
+                    KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+
+                    if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
+                        KQ_reg[j] = sum;
+                    }
+                }
+            }
+        } else {
+            if constexpr (KQ_f16dq) {
+                // Fused NVFP4 decode + dense f16 MMA, fully register-resident (v2; NVFP4_FA_RESEARCH.md
+                // SS10e).  No smem tiles / warp syncs: the m16n8k16 fragment map is lane-aligned - lane
+                // (g, tg) owns token rows g and g+8 at coords {2tg,2tg+1, 8+2tg, 9+2tg} of each 16-coord
+                // nvfp4 subblock (= exactly one k-fragment), and query column g in the B operand.  So the
+                // A fragments are decoded straight from the two gmem words of that subblock (byte-permuted
+                // nibbles x UE4M3 scale) and the B fragments (Q) are constant over the whole CTA run.
+                const int tok0 = WARP_SIZE*threadIdx.y;
+                const int g  = threadIdx.x >> 2;
+                const int tg = threadIdx.x &  3;
+
+                const bool    q_active = (g < ncols) && (ncols == 1 || ic0 + g < int(ne01.z));
+                const float * Q_g      = (const float *) (Q + g*nb01);
+
+                uint32_t Bfr[D/16][2];
+#pragma unroll
+                for (int f = 0; f < D/16; ++f) {
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) {
+                        const int c = 16*f + 8*e + 2*tg;   // half2 word holds coords c, c+1
+                        const half2 h = q_active ? __floats2half2_rn(Q_g[c + 0], Q_g[c + 1])
+                                                 : __floats2half2_rn(0.0f, 0.0f);
+                        Bfr[f][e] = (uint32_t) *reinterpret_cast<const uint32_t *>(&h);
+                    }
+                }
+
+                const size_t   koff = (size_t) (tok0 + g)*nb11;
+                const uint32_t sq   = (2*tg) | ((2*tg + 1) << 4); // byte_perm picks subblock bytes 2tg, 2tg+1
+
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    float Dt[4] = { 0.f, 0.f, 0.f, 0.f };
+#pragma unroll
+                    for (int f = 0; f < D/16; ++f) {
+                        const block_nvfp4 * K_r0 = (const block_nvfp4 *) (K + koff + (size_t) (16*mt + 0)*nb11) + (f >> 2);
+                        const block_nvfp4 * K_r1 = (const block_nvfp4 *) (K + koff + (size_t) (16*mt + 8)*nb11) + (f >> 2);
+                        const int sb = 8*(f & 3);
+
+                        // 8-byte subblock words -> the two bytes holding coords (2tg, 2tg+1) / (8+2tg, 9+2tg):
+                        // byte b of the subblock stores coords (b, b+8) as (low, high) nibbles.
+                        const uint32_t s0 = __byte_perm(*(const uint32_t *) &K_r0->qs[sb + 0],
+                                                       *(const uint32_t *) &K_r0->qs[sb + 4], sq);
+                        const uint32_t s1 = __byte_perm(*(const uint32_t *) &K_r1->qs[sb + 0],
+                                                       *(const uint32_t *) &K_r1->qs[sb + 4], sq);
+
+                        const half2 sh0 = ggml_cuda_ue4m3_dword_h2(*(const uint32_t *) &K_r0->d[0], f & 3);
+                        const half2 sh1 = ggml_cuda_ue4m3_dword_h2(*(const uint32_t *) &K_r1->d[0], f & 3);
+
+                        // Fragment pairs are nibbles at stride 2 (byte b of s0 holds coords (b, b+8)):
+                        // pack each MMA pair (elem0 low, elem1 high) and decode via HW cvt -
+                        // bitwise-identical to ggml_cuda_e2m1_pair_f16 (probe fa_nvfp4_cvt_probe),
+                        // one instruction per pair instead of ~5.
+                        const uint32_t q0 = ( s0        & 0x0Fu) | (( s0 >> 4) & 0xF0u); // coords (c,   c+1)
+                        const uint32_t q2 = ((s0 >> 4)  & 0x0Fu) | (( s0 >> 8) & 0xF0u); // coords (c+8, c+9)
+                        const uint32_t q1 = ( s1        & 0x0Fu) | (( s1 >> 4) & 0xF0u);
+                        const uint32_t q3 = ((s1 >> 4)  & 0x0Fu) | (( s1 >> 8) & 0xF0u);
+
+                        const uint32_t c0 = ggml_cuda_e2m1x2_f16(q0);
+                        const uint32_t c2 = ggml_cuda_e2m1x2_f16(q2);
+                        const uint32_t c1 = ggml_cuda_e2m1x2_f16(q1);
+                        const uint32_t c3 = ggml_cuda_e2m1x2_f16(q3);
+
+                        half2 hv0 = __hmul2(*reinterpret_cast<const half2 *>(&c0), sh0);
+                        half2 hv1 = __hmul2(*reinterpret_cast<const half2 *>(&c1), sh1);
+                        half2 hv2 = __hmul2(*reinterpret_cast<const half2 *>(&c2), sh0);
+                        half2 hv3 = __hmul2(*reinterpret_cast<const half2 *>(&c3), sh1);
+
+                        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                     : "+f"(Dt[0]), "+f"(Dt[1]), "+f"(Dt[2]), "+f"(Dt[3])
+                                     : "r"(*(uint32_t *) &hv0), "r"(*(uint32_t *) &hv1),
+                                       "r"(*(uint32_t *) &hv2), "r"(*(uint32_t *) &hv3),
+                                       "r"(Bfr[f][0]), "r"(Bfr[f][1]));
+                    }
+#pragma unroll
+                    for (int e = 0; e < 2; ++e) {
+                        const int j = 2*tg + e;
+                        if (j < ncols) {
+                            F4_raw[j*nthreads + tok0 + 16*mt + g + 0] = Dt[0 + e]*scale;
+                            F4_raw[j*nthreads + tok0 + 16*mt + g + 8] = Dt[2 + e]*scale;
+                        }
+                    }
+                }
+            } else {
+            // Each warp stages its 32 K rows into fragment-native words + scale dwords, then runs
+            // 2 x m16n8k64 block-scaled mma per k-fragment (m = tokens, n = queries).
+            const int tok0 = WARP_SIZE*threadIdx.y;
+
+#pragma unroll
+            for (int i0 = 0; i0 < 32*(D/16); i0 += WARP_SIZE) {
+                const int i  = i0 + threadIdx.x;
+                const int r  = i / (D/16);
+                const int pr = i % (D/16);
+
+                const block_nvfp4 * K_b = (const block_nvfp4 *) (K + (size_t) (tok0 + r)*nb11);
+                const int * words       = (const int *) &K_b[pr >> 2];
+
+                uint32_t N0, N1;
+                ggml_cuda_fp4_repack_pair((uint32_t) words[1 + 2*(pr & 3)], (uint32_t) words[2 + 2*(pr & 3)], N0, N1);
+                F4_Knc[r*F4_STR + 2*pr]     = (int) N0;
+                F4_Knc[r*F4_STR + 2*pr + 1] = (int) N1;
+            }
+            for (int i0 = 0; i0 < 32*(D/64); i0 += WARP_SIZE) {
+                const int i = i0 + threadIdx.x;
+                const int r = i / (D/64);
+                const int f = i % (D/64);
+                const block_nvfp4 * K_b = (const block_nvfp4 *) (K + (size_t) (tok0 + r)*nb11);
+                F4_Ksc[r*(D/64) + f] = *(const int *) &K_b[f].d[0];
+            }
+            __syncwarp();
+
+            const int g = threadIdx.x >> 2;
+            const int t = threadIdx.x &  3;
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                using namespace ggml_cuda_mma;
+                tile<16, 8, float> Dt;
+#pragma unroll
+                for (int f = 0; f < D/64; ++f) {
+                    tile<16, 8, int> At;
+                    tile<8, 8, int>  Bt;
+                    At.x[0] = F4_Knc[(16*mt + g + 0)*F4_STR + f*8 + t + 0];
+                    At.x[1] = F4_Knc[(16*mt + g + 8)*F4_STR + f*8 + t + 0];
+                    At.x[2] = F4_Knc[(16*mt + g + 0)*F4_STR + f*8 + t + 4];
+                    At.x[3] = F4_Knc[(16*mt + g + 8)*F4_STR + f*8 + t + 4];
+                    Bt.x[0] = F4_Qnc[g*F4_STR + f*8 + t + 0];
+                    Bt.x[1] = F4_Qnc[g*F4_STR + f*8 + t + 4];
+                    const uint32_t sa = (uint32_t) F4_Ksc[(16*mt + g + 8*(threadIdx.x & 1))*(D/64) + f];
+                    const uint32_t sb = (uint32_t) F4_Qsc[g*(D/64) + f];
+                    mma_block_scaled_fp4<GGML_TYPE_NVFP4>(Dt, At, Bt, sa, sb);
+                    // Residual chain Q_lo: same K fragments & scales, accumulates into the same Dt.
+                    tile<8, 8, int> Bt2;
+                    Bt2.x[0] = F4_Qnc2[g*F4_STR + f*8 + t + 0];
+                    Bt2.x[1] = F4_Qnc2[g*F4_STR + f*8 + t + 4];
+                    const uint32_t sb2 = (uint32_t) F4_Qsc2[g*(D/64) + f];
+                    mma_block_scaled_fp4<GGML_TYPE_NVFP4>(Dt, At, Bt2, sa, sb2);
+                }
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int j = 2*t + e;
+                    if (j < ncols) {
+                        F4_raw[j*nthreads + tok0 + 16*mt + g + 0] = Dt.x[0 + e]*scale;
+                        F4_raw[j*nthreads + tok0 + 16*mt + g + 8] = Dt.x[2 + e]*scale;
+                    }
+                }
+            }
+            }
+
+            __syncwarp();
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
-                sum = warp_reduce_sum<nthreads_KQ>(sum);
+                float sum = F4_raw[j*nthreads + tid];
 
                 if (use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    sum += slope*__half2float(maskh[j*ne11 + tid]);
                 }
 
-                KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
-
-                if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
-                    KQ_reg[j] = sum;
-                }
+                KQ_max_new[j] = fmaxf(KQ_max_new[j], warp_reduce_max(sum + FATTN_KQ_MAX_OFFSET));
+                KQ_reg[j] = sum;
             }
         }
 
@@ -323,6 +700,9 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
+            // First block of this V row inside the cache tensor (dither seed base, see ggml-common.h):
+            const int64_t v_row_ibase = (V - V_ptr) / v_blk_bytes + (int64_t) k*v_blk_per_row;
+
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
 #pragma unroll
@@ -335,14 +715,14 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
                     dequantize_V(V + k*nb21, tmp_f,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, v_row_ibase);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
                     dequantize_V(V + k*nb21, tmp,
-                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, v_row_ibase);
                 }
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -362,7 +742,7 @@ static __global__ void flash_attn_ext_vec(
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
                 dequantize_V(V + k*nb21, tmp,
-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, v_row_ibase);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
@@ -528,16 +908,30 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool kq_mma_build, bool kq_f16_build>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
+    if constexpr (kq_f16_build) {
+        if (turing_mma_available(cc) && ggml_cuda_fattn_vec_kq_mma_f16_enabled()) {
+            fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, false, true>;
+            launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+            return;
+        }
+    }
+    if constexpr (kq_mma_build) {
+        if (blackwell_mma_available(cc) && ggml_cuda_fattn_vec_kq_mma_enabled()) {
+            fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, true>;
+            launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
+            return;
+        }
+    }
+    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
 }
 
@@ -549,14 +943,19 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
+    // the mma KQ variant needs whole 64-coord k-fragments and 16-token m-tiles
+    constexpr bool kq_mma_build  = (type_K == GGML_TYPE_NVFP4) && (D >= 128);
+    // fused f16 KQ needs whole 16-coord k-fragments; probe-validated at D=128/256
+    constexpr bool kq_f16_build  = (type_K == GGML_TYPE_NVFP4) && (D == 128 || D == 256);
+
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, kq_mma_build, kq_f16_build>(ctx, dst);
         } else {
             constexpr bool use_logit_softcap = true;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, kq_mma_build, kq_f16_build>(ctx, dst);
         }
         return;
     }
@@ -564,10 +963,10 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     constexpr int cols_per_block = 2;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, kq_mma_build, kq_f16_build>(ctx, dst);
     } else {
         constexpr bool use_logit_softcap = true;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, kq_mma_build, kq_f16_build>(ctx, dst);
     }
 }
 
@@ -622,3 +1021,36 @@ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_TURBO3_0);
 // turbo4 K has a native vec_dot (vec_dot_fattn_vec_KQ_turbo4_0). No 64 case: QK_TURBO4 = 128 doesn't fit a 64-element row.
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0);
+// turbo4 K + turbo4 V (competitor gate row): native vec instance (see template-instances note re: the MMA speed gate)
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+
+// Q_prod (MSE + 1-bit QJL residual sign) combos.
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_1, GGML_TYPE_TURBO4Q_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_1, GGML_TYPE_TURBO4Q_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_TURBO4Q_0);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_1, GGML_TYPE_TURBO3Q_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_1, GGML_TYPE_TURBO3Q_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_TURBO3Q_0);
+
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4Q_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4Q_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4Q_0, GGML_TYPE_TURBO4Q_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4Q_0, GGML_TYPE_TURBO4Q_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3Q_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3Q_0);
+
+// NVFP4-like KV cache (Stage A): single-level NVFP4 (per-16 UE4M3 + E2M1). Unrotated, no dither;
+// the block size (64) fits a 64-element K row, so all three head sizes have instances.
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_1, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_1, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_NVFP4);
+
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_NVFP4);

@@ -292,14 +292,114 @@ int main(void) {
         check(tot.norm_err < 0.01, "4c. turbo2 corrected norm preserved (<1%)");
     }
 
+    /* ---- turbo3q: 2-bit MSE + 1-bit QJL residual sign (Q_prod, arXiv 2504.19874 Alg. 2) ---- */
+    {
+        const int nrow = 4000;
+        measure_t tot = { 0, 0, 0, 0, 0 };
+        double ip_num = 0.0, ip_den = 0.0;   /* <dq, x_rot> / <x_rot, x_rot>: inner-product shrinkage */
+        for (int row = 0; row < nrow; row++) {
+            const int n = (row % 2 == 0) ? 128 : 256;
+            float x[256], dq[256];
+            block_turbo3q_0 q[2];
+            for (int i = 0; i < n; i++) x[i] = (float)rng_normal();
+            quantize_turbo3q_0(x, q, 1, n, NULL);
+            dequantize_row_turbo3q_0(q, dq, n);
+            measure_t m = measure(x, dq, n);
+            tot.rmse_rot += m.rmse_rot; tot.rmse_back += m.rmse_back;
+            if (m.norm_err > tot.norm_err) tot.norm_err = m.norm_err;
+            if (m.max_coord_err > tot.max_coord_err) tot.max_coord_err = m.max_coord_err;
+            for (int g = 0; g < n / 128; g++) {
+                float xr[128];
+                memcpy(xr, x + g * 128, sizeof(xr));
+                ref_fwht(xr, 128);
+                double num = 0.0, den = 0.0;
+                for (int i = 0; i < 128; i++) {
+                    num += (double)dq[g * 128 + i] * xr[i];
+                    den += (double)xr[i] * xr[i];
+                }
+                ip_num += num; ip_den += den;
+            }
+        }
+        tot.rmse_rot /= nrow; tot.rmse_back /= nrow;
+        const double ip_ratio = ip_num / ip_den;
+        printf("  turbo3q: rel RMSE rot=%.4f back=%.4f (Q_prod 2bit+QJL ~0.25), max coord err=%.3f, <dq,x>/<x,x>=%.5f (QJL unbiased, q=k)\n",
+               tot.rmse_rot, tot.rmse_back, tot.max_coord_err, ip_ratio);
+        check(tot.rmse_rot < 0.28 && tot.rmse_back < 0.28, "3d. turbo3q RMSE within bounds");
+#ifdef TURBO_QJL_MSE_OPTIMAL
+        check(tot.rmse_rot < 0.23, "3d2. turbo3q RMSE improves with MSE alpha");
+        check(ip_ratio > 0.915, "4d. turbo3q inner product (q=k) shrinkage bounded (MSE alpha)");
+#else
+        check(ip_ratio > 0.945, "4d. turbo3q QJL: inner product (q=k) shrinkage < 5.5%");
+#endif
+
+        float x[128]; block_turbo3q_0 a[1], b[1];
+        for (int i = 0; i < 128; i++) x[i] = (float)rng_normal();
+        quantize_row_turbo3q_0_ref(x, a, 128);
+        quantize_row_turbo3q_0_ref(x, b, 128);
+        check(memcmp(a, b, sizeof(a)) == 0, "5d. turbo3q quantize deterministic");
+
+        memset(x, 0, sizeof(x));
+        quantize_row_turbo3q_0_ref(x, a, 128);
+        float y[128];
+        dequantize_row_turbo3q_0(a, y, 128);
+        int allzero = 1;
+        for (int i = 0; i < 128; i++) if (y[i] != 0.0f) allzero = 0;
+        check(allzero, "5e. turbo3q all-zero row -> all-zero dequant");
+    }
+
+    /* ---- turbo4q: 3-bit MSE + 1-bit QJL residual sign ---- */
+    {
+        const int nrow = 4000;
+        measure_t tot = { 0, 0, 0, 0, 0 };
+        double ip_num = 0.0, ip_den = 0.0;
+        for (int row = 0; row < nrow; row++) {
+            const int n = (row % 2 == 0) ? 128 : 256;
+            float x[256], dq[256];
+            block_turbo4q_0 q[2];
+            for (int i = 0; i < n; i++) x[i] = (float)rng_normal();
+            quantize_turbo4q_0(x, q, 1, n, NULL);
+            dequantize_row_turbo4q_0(q, dq, n);
+            measure_t m = measure(x, dq, n);
+            tot.rmse_rot += m.rmse_rot; tot.rmse_back += m.rmse_back;
+            if (m.norm_err > tot.norm_err) tot.norm_err = m.norm_err;
+            if (m.max_coord_err > tot.max_coord_err) tot.max_coord_err = m.max_coord_err;
+            for (int g = 0; g < n / 128; g++) {
+                float xr[128];
+                memcpy(xr, x + g * 128, sizeof(xr));
+                ref_fwht(xr, 128);
+                double num = 0.0, den = 0.0;
+                for (int i = 0; i < 128; i++) {
+                    num += (double)dq[g * 128 + i] * xr[i];
+                    den += (double)xr[i] * xr[i];
+                }
+                ip_num += num; ip_den += den;
+            }
+        }
+        tot.rmse_rot /= nrow; tot.rmse_back /= nrow;
+        const double ip_ratio = ip_num / ip_den;
+        printf("  turbo4q: rel RMSE rot=%.4f back=%.4f (Q_prod 3bit+QJL ~0.13), max coord err=%.3f, <dq,x>/<x,x>=%.5f (QJL unbiased, q=k)\n",
+               tot.rmse_rot, tot.rmse_back, tot.max_coord_err, ip_ratio);
+        check(tot.rmse_rot < 0.16 && tot.rmse_back < 0.16, "3e. turbo4q RMSE within bounds");
+#ifdef TURBO_QJL_MSE_OPTIMAL
+        check(tot.rmse_rot < 0.13, "3e2. turbo4q RMSE improves with MSE alpha");
+        check(ip_ratio > 0.965, "4e. turbo4q inner product (q=k) shrinkage bounded (MSE alpha)");
+#else
+        check(ip_ratio > 0.975, "4e. turbo4q QJL: inner product (q=k) shrinkage < 2.5%");
+#endif
+    }
+
     /* ---- 6. block layout ---- */
     {
         check(sizeof(block_turbo2_0) == 34, "6a. sizeof(block_turbo2_0)==34 (2.125 bpw)");
         check(sizeof(block_turbo3_0) == 50, "6b. sizeof(block_turbo3_0)==50 (3.125 bpw)");
         check(sizeof(block_turbo4_0) == 66, "6c. sizeof(block_turbo4_0)==66 (4.125 bpw)");
-        check(QK_TURBO2 == 128 && QK_TURBO3 == 128 && QK_TURBO4 == 128, "6d. QK_TURBO* == 128");
+        check(sizeof(block_turbo3q_0) == 52, "6f. sizeof(block_turbo3q_0)==52 (3.25 bpw)");
+        check(sizeof(block_turbo4q_0) == 68, "6g. sizeof(block_turbo4q_0)==68 (4.25 bpw)");
+        check(QK_TURBO2 == 128 && QK_TURBO3 == 128 && QK_TURBO4 == 128 &&
+              QK_TURBO3Q == 128 && QK_TURBO4Q == 128, "6d. QK_TURBO* == 128");
         check(GGML_TYPE_TURBO2_0 == 44 && GGML_TYPE_TURBO3_0 == 45 && GGML_TYPE_TURBO4_0 == 46,
               "6e. enum ids 44/45/46");
+        check(GGML_TYPE_TURBO3Q_0 == 48 && GGML_TYPE_TURBO4Q_0 == 49, "6h. enum ids 48/49 (turbo3q/turbo4q)");
     }
 
     printf("\n%s (%d failures)\n", failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED", failures);

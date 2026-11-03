@@ -97,7 +97,7 @@ static __global__ void lightning_indexer_kernel_wmma(
             const int i_kv = start_kv + i_k_vec;
             if (i_kv < n_kv) {
                 const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
-                dequantize_k(k_base, &k_shared_h[i_k_vec][i_embd][0], i_embd * 4);
+                dequantize_k(k_base, &k_shared_h[i_k_vec][i_embd][0], i_embd * 4, 0 /* v_ibase: the indexer K types are never dithered */);
             } else {
                 *(int2*) &k_shared_h[i_k_vec][i_embd] = make_int2(0, 0);
             }
@@ -292,7 +292,7 @@ static __global__ void lightning_indexer_kernel_vec(
             int i_kv = start_kv + k;
             if (i_kv < n_kv) {
                 const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
-                dequantize_k(k_base, &k_reg_f[k], i_lane * 4);
+                dequantize_k(k_base, &k_reg_f[k], i_lane * 4, 0 /* v_ibase: the indexer K types are never dithered */);
             } else {
                 k_reg_f[k] = make_float4(0, 0, 0, 0);
             }

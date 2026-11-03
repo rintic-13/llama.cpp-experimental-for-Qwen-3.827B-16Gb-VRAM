@@ -339,10 +339,14 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
         }
 
+        // nvfp4 is quantized but has no rotation anywhere in the codec (Stage A writes raw,
+        // unrotated rows - the probe showed raw beats WHT-rotated on real K/V: 0.8715 vs 0.9076 K).
+        // Exclude it here so the plain Hadamard graph rotator stays off.
         attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
+            type_k != GGML_TYPE_NVFP4 &&
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
@@ -356,6 +360,7 @@ llama_kv_cache::llama_kv_cache(
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
+            type_v != GGML_TYPE_NVFP4 &&
             hparams.n_embd_head_v() % 64 == 0;
     }
 

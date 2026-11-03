@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_set>
+#include <cstdlib>
 
 #include "arg.h"
 #include "build-info.h"
@@ -517,6 +518,31 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     }
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
+    }
+    // TurboQuant KV cache types (this fork; names match ggml.c type_name table).
+    // Note: benchmarking these requires -fa on and a compiled FA template instance
+    // for the K/V pair (see the GGML_CUDA_FA_QUANTS cmake list).
+    if (s == "turbo2") {
+        return GGML_TYPE_TURBO2_0;
+    }
+    if (s == "turbo3") {
+        return GGML_TYPE_TURBO3_0;
+    }
+    if (s == "turbo4") {
+        return GGML_TYPE_TURBO4_0;
+    }
+    if (s == "turbo5") {
+        return GGML_TYPE_TURBO5_0;
+    }
+    if (s == "turbo3q") {
+        return GGML_TYPE_TURBO3Q_0;
+    }
+    if (s == "turbo4q") {
+        return GGML_TYPE_TURBO4Q_0;
+    }
+    // NVFP4-like KV cache (Stage A, CUDA FA vec kernel only).
+    if (s == "nvfp4") {
+        return GGML_TYPE_NVFP4;
     }
 
     return GGML_TYPE_COUNT;
@@ -2223,6 +2249,13 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     if (level == GGML_LOG_LEVEL_ERROR) {
+        fprintf(stderr, "%s", text);
+        return;
+    }
+    // pass through W-level logs (e.g. the FATTN_DEBUG routing log from fattn.cu, and the
+    // "no FlashAttention vector kernel ... converting to f16" warning) when routed-debug is on;
+    // default behavior (swallow everything but errors) is unchanged.
+    if (level == GGML_LOG_LEVEL_WARN && getenv("GGML_FATTN_DEBUG") != nullptr) {
         fprintf(stderr, "%s", text);
         return;
     }
