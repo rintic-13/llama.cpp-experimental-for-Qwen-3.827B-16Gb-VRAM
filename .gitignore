@@ -22,6 +22,7 @@ ppl_results/
 engine_ab_*/
 turbo_kq_*/
 s5/
+/release/
 
 # fork: gpu-gate harness scripts (kept on disk, not in VCS)
 gate_scale_search_*.cmd
