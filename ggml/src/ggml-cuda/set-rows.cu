@@ -724,7 +724,89 @@ static __global__ void k_set_rows_turbo4(
     x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
     __syncthreads();
 
-    // ---- Step 5: Quantize element j to 4-bit centroid (subtractive dither when enabled) ----
+    // ---- Step 5: quantize element j to 4-bit centroid (subtractive dither when enabled) ----
+#ifdef GGML_TURBO_SCALE_SEARCH
+    // [llama-tq encoder upgrade] mirror of the CPU reference codec (ggml-turbo-quant.c):
+    //   32 trial scales, per-trial warp-tree sums, thread 0 scans k ascending with strict >
+    //   (the exact nominal multiplier k=16 wins ties), the winner is broadcast, element j is
+    //   re-quantized at it, and the stored scalar is the unbiased scale grp_norm / inner
+    //   instead of the norm correction grp_norm / ||rec||.
+    // The warp tree + 4-warp sum differs from the CPU serial sum at last-ulp (exactly like
+    // the group norm does today): near-tie winners may differ per engine, and every written
+    // cache stays self-describing (idx + norm) and self-consistent for its readers.
+    const float xv = x[j];
+
+    __shared__ float warp_in [TURBO_N_TRIAL_SCALES][n_warps];
+    __shared__ float warp_rsq[TURBO_N_TRIAL_SCALES][n_warps];
+
+#pragma unroll
+    for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+        const uint8_t tidx = turbo_nearest_centroid_4bit(xv * TURBO_TRIAL_SCALE_INV[k] + dith_u);
+        const float   trec = TURBO_CENTROIDS_4BIT[tidx] - dith_u;
+
+        float w_in  = xv * trec;
+        float w_rsq = trec * trec;
+
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            w_in  += __shfl_xor_sync(0xffffffff, w_in,  offset, WARP_SIZE);
+            w_rsq += __shfl_xor_sync(0xffffffff, w_rsq, offset, WARP_SIZE);
+        }
+
+        if (j % WARP_SIZE == 0) {
+            warp_in[k][j / WARP_SIZE]  = w_in;
+            warp_rsq[k][j / WARP_SIZE] = w_rsq;
+        }
+    }
+    __syncthreads();
+
+    __shared__ float s_best_in;
+    __shared__ int   s_best_k;
+    if (j == 0) {
+        float best_in  = 0.0f;
+        float best_rsq = 0.0f;
+        int   best_k   = 16;
+
+        for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+            float inner = 0.0f, rsq = 0.0f;
+
+            for (int w = 0; w < n_warps; w++) {
+                inner += warp_in[k][w];
+                rsq   += warp_rsq[k][w];
+            }
+
+            if (inner <= 1e-10f) {
+                continue; // degenerate trial (zero block): never selected
+            }
+
+            if (best_in <= 0.0f || inner * inner * best_rsq > best_in * best_in * rsq) {
+                best_in  = inner;
+                best_rsq = rsq;
+                best_k   = k;
+            }
+        }
+
+        s_best_in = best_in;
+        s_best_k  = best_k;
+    }
+    __syncthreads();
+
+    // quantize element j at the winning scale (same operand order as the trial loop)
+    const uint8_t idx = turbo_nearest_centroid_4bit(xv * TURBO_TRIAL_SCALE_INV[s_best_k] + dith_u);
+
+    // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
+    // Thread pair (j, j+1) shares one qs byte.
+    const uint8_t my_nibble = idx & 0xF;
+    const uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
+    if (j % 2 == 0) {
+        blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
+    }
+
+    // ---- Step 8: write the unbiased scale (one thread per block) ----
+    const float corrected_norm = (s_best_in > 1e-10f) ? grp_norm / s_best_in : grp_norm;
+    if (j == 0) {
+        blk->norm = __float2half(corrected_norm);
+    }
+#else
     const uint8_t idx = turbo_nearest_centroid_4bit(x[j] + dith_u);
 
     // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
@@ -760,6 +842,7 @@ static __global__ void k_set_rows_turbo4(
     if (j == 0) {
         blk->norm = __float2half(corrected_norm);
     }
+#endif
 }
 
 // ---- TurboQuant5 set_rows: same structure, 5-bit codebook ----
@@ -1138,6 +1221,97 @@ static __global__ void k_set_rows_turbo3(
     __syncthreads();
 
     // ---- Quantize element j to 3-bit centroid ----
+#ifdef GGML_TURBO_SCALE_SEARCH
+    // [llama-tq encoder upgrade] mirror of k_set_rows_turbo4 above and of the CPU reference
+    // codec: 32 trial scale multipliers, warp-tree sums per trial, thread 0 picks the max
+    // angle cosine (k ascending, strict >, nominal k=16 wins ties), unbiased stored scale.
+    const float xv = x[j];
+
+    __shared__ float warp_in [TURBO_N_TRIAL_SCALES][n_warps];
+    __shared__ float warp_rsq[TURBO_N_TRIAL_SCALES][n_warps];
+
+#pragma unroll
+    for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+        const uint8_t tidx = turbo_nearest_centroid_3bit(xv * TURBO_TRIAL_SCALE_INV[k] + dith_u);
+        const float   trec = TURBO_CENTROIDS_3BIT[tidx] - dith_u;
+
+        float w_in  = xv * trec;
+        float w_rsq = trec * trec;
+
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            w_in  += __shfl_xor_sync(0xffffffff, w_in,  offset, WARP_SIZE);
+            w_rsq += __shfl_xor_sync(0xffffffff, w_rsq, offset, WARP_SIZE);
+        }
+
+        if (j % WARP_SIZE == 0) {
+            warp_in[k][j / WARP_SIZE]  = w_in;
+            warp_rsq[k][j / WARP_SIZE] = w_rsq;
+        }
+    }
+    __syncthreads();
+
+    __shared__ float s_best_in;
+    __shared__ int   s_best_k;
+    if (j == 0) {
+        float best_in  = 0.0f;
+        float best_rsq = 0.0f;
+        int   best_k   = 16;
+
+        for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+            float inner = 0.0f, rsq = 0.0f;
+
+            for (int w = 0; w < n_warps; w++) {
+                inner += warp_in[k][w];
+                rsq   += warp_rsq[k][w];
+            }
+
+            if (inner <= 1e-10f) {
+                continue; // degenerate trial (zero block): never selected
+            }
+
+            if (best_in <= 0.0f || inner * inner * best_rsq > best_in * best_in * rsq) {
+                best_in  = inner;
+                best_rsq = rsq;
+                best_k   = k;
+            }
+        }
+
+        s_best_in = best_in;
+        s_best_k  = best_k;
+    }
+    __syncthreads();
+
+    const uint8_t idx = turbo_nearest_centroid_3bit(xv * TURBO_TRIAL_SCALE_INV[s_best_k] + dith_u);
+
+    // ---- Pack qs: 4 elements per byte via a 4-lane shuffle gather ----
+    const uint8_t my_low2 = idx & 0x3;
+    uint8_t qs_byte = 0;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        qs_byte |= (uint8_t) (__shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE) << (k * 2));
+    }
+    if (lane % 4 == 0) {
+        blk->qs[j / 4] = qs_byte;
+    }
+
+    // ---- Pack signs: 8 elements per byte via an 8-lane shuffle gather ----
+    const uint8_t my_sign = (idx >> 2) & 1;
+    uint8_t signs_byte = 0;
+#pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        signs_byte |= (uint8_t) (__shfl_sync(0xffffffff, my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
+    }
+    if (lane % 8 == 0) {
+        blk->signs[j / 8] = signs_byte;
+    }
+
+    // ---- Unbiased stored scale: grp_norm / <x_hat_rot, rec> (see the turbo4 kernel above) ----
+    const float corrected_norm = (s_best_in > 1e-10f) ? grp_norm / s_best_in : grp_norm;
+
+    if (j == 0) {
+        blk->norm = __float2half(corrected_norm);
+    }
+#else
     const uint8_t idx = turbo_nearest_centroid_3bit(x[j] + dith_u);
 
     // ---- Pack qs: 4 elements per byte via a 4-lane shuffle gather ----
@@ -1184,6 +1358,7 @@ static __global__ void k_set_rows_turbo3(
     if (j == 0) {
         blk->norm = __float2half(corrected_norm);
     }
+#endif
 }
 
 template<typename src_t, typename idx_t>

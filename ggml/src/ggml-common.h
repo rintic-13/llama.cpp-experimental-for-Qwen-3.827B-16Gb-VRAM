@@ -548,6 +548,35 @@ static_assert(QK_TURBO4Q == 128, "turbo4q kernels assume QK_TURBO4Q == 128");
 #define TURBO_DITHER_STEP_3BIT 0.044243f   // narrowest 3-bit cell width, normalized centroid units
 #define TURBO_DITHER_STEP_4BIT 0.022824f   // narrowest 4-bit cell width
 
+// ---- TurboQuant encoder upgrade: scale search + unbiased stored scale (GGML_TURBO_SCALE_SEARCH) ----
+// Port of the llama-tq encoder upgrade (docs/kv-cache, "scale search over the codebook" +
+// "unbiased scale", 2026-10-11). Encode-side only: the block layout, the (centroid - u) * norm
+// dequant and every reader kernel (FA vec / convert / GGUF compat) are untouched.
+// For each 128-value block the assignment is tried at TURBO_N_TRIAL_SCALES codebook multipliers
+// (linear 0.36x .. 1.60x, step 0.04; index 16 is the exact nominal scale, inv = 1.0f) and the
+// assignment with the smallest angle to the block wins - tracked sqrt-free as
+// inner^2 / rsq, inner = <x_hat_rot, rec>, rsq = ||rec||^2, x_hat_rot unit-norm after Step 3.
+// The stored scalar becomes the unbiased scale grp_norm / inner (projection of the
+// reconstruction along the input direction exact) instead of the norm correction
+// grp_norm / ||rec|| (which shrinks every score ~4% on this model, cf. the QJL notes above).
+// The table is shared by the CPU reference codec (ggml-turbo-quant.c) and the CUDA
+// k_set_rows_turbo3/4 mirror; both scan k ascending with strict > (nominal wins ties).
+#define TURBO_N_TRIAL_SCALES 32
+#if defined(__CUDACC__)
+static __constant__ float TURBO_TRIAL_SCALE_INV[TURBO_N_TRIAL_SCALES] = {
+#else
+static const float TURBO_TRIAL_SCALE_INV[TURBO_N_TRIAL_SCALES] = {
+#endif
+    2.777777671813965f, 2.5f,             2.2727272510528564f, 2.0833332538604736f,
+    1.923076868057251f, 1.7857142686843872f, 1.6666666269302368f, 1.5625f,
+    1.470588207244873f, 1.3888888359069824f, 1.3157894611358643f, 1.25f,
+    1.1904761791229248f, 1.1363636255264282f, 1.08695650100708f, 1.0416666269302368f,
+    1.0f,               0.9615384340286255f, 0.9259259104728699f, 0.8928571343421936f,
+    0.8620689511299133f, 0.8333333134651184f, 0.8064516186714172f, 0.78125f,
+    0.7575757503509521f, 0.7352941036224365f, 0.7142857313156128f, 0.6944444179534912f,
+    0.6756756901741028f, 0.6578947305679321f, 0.6410256624221802f, 0.625f
+};
+
 #ifdef GGML_TURBO_DITHER
 #ifdef __CUDACC__
 #define GGML_TURBO_INLINE __device__ __forceinline__

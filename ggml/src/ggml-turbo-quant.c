@@ -289,6 +289,61 @@ void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * G
         turbo_cpu_fwht(buf, QK_TURBO3);
 
         // 3-bit index split: low 2 bits in qs[], high bit in signs[]
+#ifdef GGML_TURBO_SCALE_SEARCH
+        // [llama-tq encoder upgrade] see ggml-common.h above the dither constants: 32-trial
+        //   scale search (winner = max angle cosine, sqrt-free inner^2/rsq, k=16 is the exact
+        //   nominal multiplier and wins ties) + unbiased stored scale grp_norm/inner.
+        //   Block layout, dither rule and the (centroid - u) * norm dequant are unchanged.
+        //   The CUDA k_set_rows_turbo3 mirror uses the same tables and scan order but a
+        //   different summation tree, so near-tie winners may differ per engine - each written
+        //   cache is self-describing and self-consistent (same rule as the dither seed).
+        float best_in  = 0.0f;
+        float best_rsq = 0.0f;
+        int   best_k   = 16;
+
+        for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+            float inner = 0.0f, rsq = 0.0f;
+
+            for (int j = 0; j < QK_TURBO3; j++) {
+#ifdef GGML_TURBO_DITHER
+                const float u   = turbo_dither((uint32_t) b, j, TURBO_DITHER_STEP_3BIT);
+                const int   idx = nearest_centroid_3bit(buf[j] * TURBO_TRIAL_SCALE_INV[k] + u);
+                const float rec = CENTROIDS_3BIT[idx] - u;
+#else
+                const int   idx = nearest_centroid_3bit(buf[j] * TURBO_TRIAL_SCALE_INV[k]);
+                const float rec = CENTROIDS_3BIT[idx];
+#endif
+                inner += buf[j] * rec;
+                rsq   += rec * rec;
+            }
+
+            if (inner <= 1e-10f) {
+                continue; // degenerate trial (zero block): never selected
+            }
+
+            if (best_in <= 0.0f || inner * inner * best_rsq > best_in * best_in * rsq) {
+                best_in = inner;
+                best_rsq = rsq;
+                best_k  = k;
+            }
+        }
+
+        memset(y[b].qs,    0, QK_TURBO3 / 4);
+        memset(y[b].signs, 0, QK_TURBO3 / 8);
+        for (int j = 0; j < QK_TURBO3; j++) {
+#ifdef GGML_TURBO_DITHER
+            const float u   = turbo_dither((uint32_t) b, j, TURBO_DITHER_STEP_3BIT);
+            const int   idx = nearest_centroid_3bit(buf[j] * TURBO_TRIAL_SCALE_INV[best_k] + u);
+#else
+            const int   idx = nearest_centroid_3bit(buf[j] * TURBO_TRIAL_SCALE_INV[best_k]);
+#endif
+            y[b].qs[j / 4]    |= (uint8_t)((idx & 0x3) << ((j % 4) * 2));
+            y[b].signs[j / 8] |= (uint8_t)(((idx >> 2) & 0x1) << (j % 8));
+        }
+
+        const float corrected = (best_in > 1e-10f) ? grp_norm / best_in : grp_norm;
+        y[b].norm = GGML_FP32_TO_FP16(corrected);
+#else
         float recon_sq = 0.0f;
         memset(y[b].qs,    0, QK_TURBO3 / 4);
         memset(y[b].signs, 0, QK_TURBO3 / 8);
@@ -311,6 +366,7 @@ void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * G
         const float recon_norm = sqrtf(recon_sq);
         const float corrected  = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
         y[b].norm = GGML_FP32_TO_FP16(corrected);
+#endif
     }
 }
 
@@ -356,6 +412,53 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         turbo_cpu_fwht(buf, QK_TURBO4);
 
         // 4-bit nibble packing: element i in low nibble of byte i/2 (upstream layout)
+#ifdef GGML_TURBO_SCALE_SEARCH
+        // [llama-tq encoder upgrade] see the TURBO3_0 path above - identical algorithm at 4 bits
+        float best_in  = 0.0f;
+        float best_rsq = 0.0f;
+        int   best_k   = 16;
+
+        for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+            float inner = 0.0f, rsq = 0.0f;
+
+            for (int j = 0; j < QK_TURBO4; j++) {
+#ifdef GGML_TURBO_DITHER
+                const float u   = turbo_dither((uint32_t) b, j, TURBO_DITHER_STEP_4BIT);
+                const int   idx = nearest_centroid_4bit(buf[j] * TURBO_TRIAL_SCALE_INV[k] + u);
+                const float rec = CENTROIDS_4BIT[idx] - u;
+#else
+                const int   idx = nearest_centroid_4bit(buf[j] * TURBO_TRIAL_SCALE_INV[k]);
+                const float rec = CENTROIDS_4BIT[idx];
+#endif
+                inner += buf[j] * rec;
+                rsq   += rec * rec;
+            }
+
+            if (inner <= 1e-10f) {
+                continue; // degenerate trial (zero block): never selected
+            }
+
+            if (best_in <= 0.0f || inner * inner * best_rsq > best_in * best_in * rsq) {
+                best_in = inner;
+                best_rsq = rsq;
+                best_k  = k;
+            }
+        }
+
+        memset(y[b].qs, 0, QK_TURBO4 / 2);
+        for (int j = 0; j < QK_TURBO4; j++) {
+#ifdef GGML_TURBO_DITHER
+            const float u   = turbo_dither((uint32_t) b, j, TURBO_DITHER_STEP_4BIT);
+            const int   idx = nearest_centroid_4bit(buf[j] * TURBO_TRIAL_SCALE_INV[best_k] + u);
+#else
+            const int   idx = nearest_centroid_4bit(buf[j] * TURBO_TRIAL_SCALE_INV[best_k]);
+#endif
+            y[b].qs[j / 2] |= (uint8_t)((idx & 0xF) << ((j % 2) * 4));
+        }
+
+        const float corrected = (best_in > 1e-10f) ? grp_norm / best_in : grp_norm;
+        y[b].norm = GGML_FP32_TO_FP16(corrected);
+#else
         float recon_sq = 0.0f;
         memset(y[b].qs, 0, QK_TURBO4 / 2);
         for (int j = 0; j < QK_TURBO4; j++) {
@@ -375,6 +478,7 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         const float recon_norm = sqrtf(recon_sq);
         const float corrected  = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
         y[b].norm = GGML_FP32_TO_FP16(corrected);
+#endif
     }
 }
 
