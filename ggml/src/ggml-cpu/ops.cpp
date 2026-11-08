@@ -8907,6 +8907,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
+    // 2026-11-08 batch F2/F3: this fork's turbo KV FA readers are GPU-only and the CPU type traits have no vec_dot for
+    // turbo types; calling the NULL kq_vec_dot was an access violation at address 0 ("module unknown" crash).
+    GGML_ASSERT((                            kq_vec_dot   ) && "fattn: CPU FA has no vec_dot for this K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
     int ith = params->ith;

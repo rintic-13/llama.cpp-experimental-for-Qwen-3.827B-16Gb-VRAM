@@ -127,6 +127,9 @@ __host__ __device__ constexpr int ggml_cuda_fattn_vec_turbo_kq_pf() {
 
 // Raw bytes of one fused turbo k-fragment for one lane (the two K rows it owns, at sub-column tg).
 // Split from the decode so the loop can prefetch it one fragment ahead.
+// 2026-11-08: the turbo5 specialization is kept for reference but is no longer instantiated -
+// turbo5 dropped from kq_f16_build (per-block frames need a warp-wide inverse FHT, which the
+// 16-coord fragment layout cannot do); its decode dot runs the FHT in vec_dot_fattn_vec_KQ_turbo5_0.
 template <ggml_type type_K> struct ggml_cuda_turbo_kq_raw;
 
 template <> struct ggml_cuda_turbo_kq_raw<GGML_TYPE_TURBO4_0> {
@@ -578,6 +581,14 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int V_rows_per_thread = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 2*cpy_ne : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
+
+    // 2026-11-08 per-block masks: dequantize_V_turbo5_0 runs the block's inverse FHT as a
+    // warp shuffle tree.  That requires the V loop's ownership to be lane l -> block-relative
+    // elements 4*l + a of whole blocks in every i_VKQ_0 iteration, which holds exactly when a
+    // full warp covers 32 lanes * V_rows_per_thread == QK_TURBO5 == 128 coordinates per iteration.
+    static_assert(type_V != GGML_TYPE_TURBO5_0 ||
+                  (nthreads_V == WARP_SIZE && nthreads_V*V_rows_per_thread == QK_TURBO5),
+                  "turbo5 V needs the warp-wide FHT lane layout");
 
     // S7: byte-indexed turbo4 centroid pairs (see the note at the top of the file).  Defined here
     // because the V-side table form below depends on it, and used further down for the KCEN array.
@@ -1600,8 +1611,12 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     // fused f16 KQ needs whole 16-coord k-fragments; probe-validated at D=128/256.
     // Turbo K (S2): QK_TURBO* = 128 coords per block = 8 fragments, so the same D gate applies
     // (no D=64 turbo-K instances exist).  Runtime default: nvfp4 ON, turbo OFF (SS12 PPL gate).
+    // 2026-11-08: turbo5 is NOT fused-buildable anymore - its per-block sign masks make the K
+    // rows frame-dependent, so the raw-afrag staging (ggml_cuda_turbo_kq_raw<TURBO5_0>) cannot
+    // produce usable values without a per-block inverse FHT; turbo5 decode uses the plain dp4a
+    // dot (vec_dot_fattn_vec_KQ_turbo5_0), which performs that FHT in-warp.
     constexpr bool kq_f16_build  = (D == 128 || D == 256) &&
-        (type_K == GGML_TYPE_NVFP4 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO5_0);
+        (type_K == GGML_TYPE_NVFP4 || type_K == GGML_TYPE_TURBO4_0);
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;

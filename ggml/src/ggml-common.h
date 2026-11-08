@@ -459,15 +459,55 @@ static_assert(sizeof(block_turbo4_0) == 66, "wrong turbo4_0 block size");
 static_assert(QK_TURBO4 == 128, "turbo4 kernels assume QK_TURBO4 == 128");
 
 // TurboQuant 5-bit: 5-bit PolarQuant indices, lower 4 bits in qs[] (nibble packed),
-// upper 1 bit in signs[].  Per block: norm(fp16) + 64 + 16 bytes = 82 bytes per 128 values = 5.125 bpw
+// upper 1 bit in signs[].  Since 2026-11-08 the codec does NOT use the shared turbo s1/s2 sign
+// masks (measured to align block errors across the cache, see TURBO5_PERBLOCK_MASK_20261108.md):
+// every 128-block is quantized in its own signed Hadamard frame
+//     G_b = D(s2_b) * H/sqrt(128) * D(s1_b)
+// whose signs come from a 16-bit seed stored in the block.  The writer derives the seed from the
+// raw block bits with a commutative integer sum (CPU and CUDA hash identical input bytes to the
+// identical seed - the byte mirror gate stays bit-exact); every reader unpacks the indices, scales
+// by norm and applies G_b^-1 with the stored seed, so dequantized K/V are returned in the RAW
+// (pre-rotation) domain and the attention graph needs no rotation chain for turbo5.
+// Per block: norm(fp16) + seed(u16) + 64 + 16 bytes = 84 bytes per 128 values = 5.25 bpw.
 #define QK_TURBO5 128
 typedef struct {
     ggml_half  norm;                    //  2 bytes: corrected L2 norm
+    uint16_t   seed;                    //  2 bytes: per-block sign-mask seed (see below)
     uint8_t    qs[QK_TURBO5 / 2];      // 64 bytes: lower 4-bit indices (nibble packed)
     uint8_t    signs[QK_TURBO5 / 8];   // 16 bytes: upper 1-bit of 5-bit index (8 per byte)
-} block_turbo5_0;                       // 82 bytes total
-static_assert(sizeof(block_turbo5_0) == sizeof(ggml_half) + QK_TURBO5/2 + QK_TURBO5/8, "wrong turbo5_0 block size/padding");
+} block_turbo5_0;                       // 84 bytes total
+static_assert(sizeof(block_turbo5_0) == sizeof(ggml_half) + sizeof(uint16_t) + QK_TURBO5/2 + QK_TURBO5/8, "wrong turbo5_0 block size/padding");
 static_assert(QK_TURBO5 == 128, "turbo5 kernels assume QK_TURBO5 == 128");
+
+// ---- turbo5 per-block sign-mask helpers (pure u64 integer arithmetic: bitwise identical on
+// CPU and CUDA, independent of summation order because the seed sum is commutative) ----
+// GGML_TURBO5_INLINE: same host/device pattern as the dither helpers below - the CUDA readers
+// (set-rows.cu, fattn-common.cuh, convert.cu) and the C reference codec (ggml-turbo-quant.c)
+// compile the identical algorithm.
+#ifdef __CUDACC__
+#define GGML_TURBO5_INLINE __device__ __forceinline__
+#else
+#define GGML_TURBO5_INLINE static inline
+#endif
+GGML_TURBO5_INLINE uint64_t ggml_turbo5_sm64(uint64_t z) {   // splitmix64 finalizer
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+// seed from the raw fp32 bits of one 128-element block (x bits, not normalized values)
+GGML_TURBO5_INLINE uint16_t ggml_turbo5_seed_bits(const uint32_t * bits) {
+    uint64_t h = 0;
+    for (int j = 0; j < 128; j++) {
+        h += (uint64_t) bits[j] * (ggml_turbo5_sm64((uint64_t) j + 0x12345678ULL) | 1ULL);
+    }
+    return (uint16_t) (ggml_turbo5_sm64(h) >> 32);
+}
+GGML_TURBO5_INLINE float ggml_turbo5_sign1(uint16_t seed, int j) {
+    return (ggml_turbo5_sm64((uint64_t) seed * 0x2545F4914F6CDD1DULL + (uint64_t) j * 0x9E3779B97F4A7C15ULL) >> 63) ? 1.0f : -1.0f;
+}
+GGML_TURBO5_INLINE float ggml_turbo5_sign2(uint16_t seed, int j) {
+    return (ggml_turbo5_sm64(((uint64_t) seed ^ 0xC2B2AE3D27D4EB4FULL) + (uint64_t) j * 0x9E3779B97F4A7C15ULL) >> 63) ? 1.0f : -1.0f;
+}
 
 // TurboQuant Q_prod (arXiv 2504.19874, Sec. 2.2 / Algorithm 2): (b-1)-bit MSE-optimal
 // PolarQuant on the rotated coordinates + 1-bit QJL sign of the residual, which makes the

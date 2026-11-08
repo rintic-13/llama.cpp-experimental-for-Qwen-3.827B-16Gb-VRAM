@@ -456,12 +456,20 @@ static bool ggml_cuda_fattn_vec_native_forced() {
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K, const ggml_type type_V) {
 #ifdef GGML_TURBO_DITHER
     if (!ggml_cuda_fattn_vec_native_forced()) {
+        // 2026-11-08 batch F (t5perblock_gate_20261108): the gate only makes sense where the f16-scratch MMA path is a
+        // working fallback for the SAME kernel choice.  Decode (nq<=2) is routed to vec unconditionally for turbo5
+        // combos (fattn.cu), so every instantiable turbo5 pair must keep its native vec instance even with
+        // GGML_CUDA_FATTN_VEC_FALLBACK=1 - otherwise routing would return NONE and llama would split FA onto CPU0.
+        // (The original justification - staged turbo5 breaking the f16 scratch - turned out to be the cont-branch
+        // misfire on interleaved KV views, fixed in fattn-common.cuh; prefill turbo5 now uses the MMA path again.)
+        // Pure turbo4/turbo3 combos keep the speed gate.
+        const bool has_turbo5 = (type_K == GGML_TYPE_TURBO5_0 || type_V == GGML_TYPE_TURBO5_0);
         if (ggml_cuda_fattn_vec_fallback_forced()) {
-            if (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_NVFP4 ||
-                type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_NVFP4) {
+            if (!has_turbo5 && (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_NVFP4 ||
+                type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_NVFP4)) {
                 return nullptr;
             }
-        } else if (type_K == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4_0) {
+        } else if (!has_turbo5 && (type_K == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4_0)) {
             return nullptr;
         }
     }
@@ -525,7 +533,11 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     // TurboQuant KV cache: K stays q5_1 (GQA 6:1 makes K quality dominant), V is quantized.
     FATTN_VEC_CASES_ALL_D(Q5_1, TURBO4_0)
     FATTN_VEC_CASES_ALL_D(Q5_1, TURBO3_0)
-    FATTN_VEC_CASES_ALL_D(Q5_1, TURBO5_0)
+    // turbo5 V has no D=64 instance: the dequant runs a warp-wide per-block inverse FHT which
+    // needs the full-warp ownership layout (nthreads_V == 32), and llama aborts turbo cache
+    // types for head_dim % 128 != 0 anyway - 64-coord blocks would straddle two rows.
+    FATTN_VEC_CASE(128, Q5_1, TURBO5_0)
+    FATTN_VEC_CASE(256, Q5_1, TURBO5_0)
 
     // K = turbo4_0, V = turbo3_0: native QK^T dot over the 4-bit centroids, no 64 case (QK_TURBO4 = 128).
     FATTN_VEC_CASE(128, TURBO4_0, TURBO3_0)
@@ -538,6 +550,13 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASE(256, TURBO5_0, TURBO4_0)
     FATTN_VEC_CASE(128, TURBO5_0, TURBO5_0)
     FATTN_VEC_CASE(256, TURBO5_0, TURBO5_0)
+    // 2026-11-08 batch F: the missing turbo5 directions.  Their building blocks already existed (vec_dot_fattn_vec_KQ
+    // for turbo4/turbo5 K, dequantize_V and the Q5_1 V dots); only the instantiations were absent.  Without an instance
+    // a turbo5 combo routes to NONE, llama splits the FA nodes onto CPU0, and CPU FA has no turbo vec_dot (assert).
+    FATTN_VEC_CASE(128, TURBO4_0, TURBO5_0)
+    FATTN_VEC_CASE(256, TURBO4_0, TURBO5_0)
+    FATTN_VEC_CASE(128, TURBO5_0, Q5_1)
+    FATTN_VEC_CASE(256, TURBO5_0, Q5_1)
 
     // Q_prod types (MSE + 1-bit QJL residual sign).  turbo3q is V-only (like turbo3_0, no K
     // vec_dot).  The turbo4q_0 combos were retired from the FA vec kernel on 2026-11-02 (worse
@@ -703,6 +722,39 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // 2026-11-08 (E1 stage stats, t5perblock_gate_20261108): turbo5 ub>1 batches printed only slashes.  The real fault
+    // was in the flat f16-staging converter, not in turbo5 magnitudes (staged values measured <=10.8, far below the f16
+    // ceiling): launch_f16 staging picked the cont/flat branch for the permuted unified-KV view and the bs=128 turbo5
+    // converter emitted garbage (bytes misread as the f16 norm field: nan pockets + inf, then an all-NaN cascade).
+    // Fixed in fattn-common.cuh by keeping permuted views on the nc strided launcher (L1: staged nan=0, PPL clean,
+    // pp512 back to ~876 t/s); the decode special-case below only keeps turbo5 off the per-token full-KV staging.
+    // What stays special here: at decode (nq<=2) turbo5 must get its native vec instance, and a combo without one
+    // (e.g. turbo5 + nvfp4) must route to NONE, not VEC - batch F showed the alternative: llama splits the FA nodes
+    // onto CPU0 (sched splits=34) and CPU FA calls ggml_type_traits_cpu(turbo).vec_dot == NULL
+    // (0xC0000005 at address 0; guard assert now lives in ggml-cpu/ops.cpp).
+    if ((K->type == GGML_TYPE_TURBO5_0 || V->type == GGML_TYPE_TURBO5_0) && Q->ne[1] <= 2) {
+        const fattn_vec_case_t turbo5_vec_case = can_use_vector_kernel ? ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) : nullptr;
+        static const bool dbg_route = getenv("GGML_FATTN_DEBUG") != nullptr;
+        if (dbg_route) {
+            static uint64_t route_seen = 0;
+            const unsigned sig = ((unsigned) K->type * 131u + (unsigned) V->type * 17u + (unsigned) Q->ne[0] +
+                                  (unsigned) (turbo5_vec_case != nullptr) * 7u) % 56u;
+            if (!(route_seen & (1ull << sig))) {
+                route_seen |= 1ull << sig;
+                GGML_LOG_WARN("FATTN_DEBUG: turbo5 decode routing: K=%s V=%s D=%d nq=%d vec_case=%d -> %s\n",
+                    ggml_type_name(K->type), ggml_type_name(V->type), (int) Q->ne[0], (int) Q->ne[1],
+                    (int) (turbo5_vec_case != nullptr), turbo5_vec_case ? "VEC(native)" : "NONE(unsupported combo)");
+            }
+        }
+        if (turbo5_vec_case != nullptr) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        if (can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_NONE;  // combo with no vec instance (e.g. turbo5+nvfp4): unsupported, not a crash
+        }
+        // K->ne[1] not FATTN_KQ_STRIDE-aligned (odd chunk sizes): vec is off, the staged MMA path handles it, fall through.
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

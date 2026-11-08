@@ -2,6 +2,7 @@
 #include "dequantize.cuh"
 
 #include <cstdint>
+#include <type_traits>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
@@ -264,6 +265,181 @@ static void dequantize_block_cont_cuda(const void * __restrict__ vx, dst_t * __r
     dequantize_block_cuda<qk, qr, dequantize_kernel, dst_t>(vx, y, k, 1, 1, 1, k/qk, k/qk, k/qk, stream);
 }
 
+// ---- turbo5 dequant (2026-11-08 per-block sign masks) ----
+// Each warp owns whole 128-coord blocks (lane l covers the block-relative coordinates
+// j = 4*l + a, i.e. qs bytes 2*l, 2*l+1 and signs byte l/2) and applies the block's inverse
+// FHT G_b^-1 with the seed stored in the block, producing RAW-domain output.  The FHT runs as
+// a warp shuffle tree exactly like dequantize_V_turbo5_0 in fattn-common.cuh (see the pairing
+// proof there).
+// This kernel replaces dequantize_block_cont_cuda<..., dequantize_turbo5_0> in all three
+// to_fp conversions and in the rowwise (from_to) case; the mmfa/vec FA f16 scratch staging and
+// ggml_get_rows fallbacks consume raw K/V, matching the FA kernels and the graph (no rotation
+// chain for turbo5).
+template <typename dst_t>
+static __global__ void dequantize_block_turbo5_cont(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t nb) {
+    static_assert(QK_TURBO5 == 128, "turbo5 dequant kernel assumes QK_TURBO5 == 128");
+    const int64_t ib  = blockIdx.x*(int64_t)(blockDim.x/WARP_SIZE) + (threadIdx.x/WARP_SIZE);
+    const int     lane = threadIdx.x % WARP_SIZE;
+
+    if (ib >= nb) {
+        return;
+    }
+
+    const block_turbo5_0 * blk = (const block_turbo5_0 *) vx + ib;
+    const float norm = __half2float(blk->norm);
+    const uint16_t seed = blk->seed;
+
+    // lane owns the block coords j = 4*lane + a (a=0..3): qs bytes 2*lane / 2*lane+1 hold them,
+    // signs byte lane/2 carries their high bits at position 4*(lane&1)+a.  Every qs byte is read
+    // once per warp, every signs byte by two lanes - no shuffle needed for the unpack.
+    const uint8_t q0 = blk->qs[2*lane + 0];
+    const uint8_t q1 = blk->qs[2*lane + 1];
+    const uint8_t sg = blk->signs[lane >> 1] >> (4*(lane & 1));
+
+    float v[4];
+    v[0] = turbo5_centroid((uint8_t) ((q0      & 0xF) | ((sg      & 1) << 4))) * norm;
+    v[1] = turbo5_centroid((uint8_t) ((q0      >>  4) | (((sg >> 1) & 1) << 4))) * norm;
+    v[2] = turbo5_centroid((uint8_t) ((q1      & 0xF) | (((sg >> 2) & 1) << 4))) * norm;
+    v[3] = turbo5_centroid((uint8_t) ((q1      >>  4) | (((sg >> 3) & 1) << 4))) * norm;
+
+    // inverse FHT: h=1,2 in-lane (j = 4*lane + a), h=4,8,16,32,64 via lane ^ m (m = h/4)
+    for (int l = 0; l < 4; ++l) {
+        v[l] *= ggml_turbo5_sign2(seed, 4*lane + l);
+    }
+    {   // h=1: pairs (4l, 4l+1), (4l+2, 4l+3)
+        const float a0 = v[0], b0 = v[1], a2 = v[2], b2 = v[3];
+        v[0] = a0 + b0; v[1] = a0 - b0;
+        v[2] = a2 + b2; v[3] = a2 - b2;
+    }
+    {   // h=2: pairs (4l, 4l+2), (4l+1, 4l+3)
+        const float a0 = v[0], a1 = v[1], b0 = v[2], b1 = v[3];
+        v[0] = a0 + b0; v[2] = a0 - b0;
+        v[1] = a1 + b1; v[3] = a1 - b1;
+    }
+#pragma unroll
+    for (int m = 1; m <= 16; m <<= 1) {   // h = 4*m
+        const float o0 = __shfl_xor_sync(0xffffffff, v[0], m, WARP_SIZE);
+        const float o1 = __shfl_xor_sync(0xffffffff, v[1], m, WARP_SIZE);
+        const float o2 = __shfl_xor_sync(0xffffffff, v[2], m, WARP_SIZE);
+        const float o3 = __shfl_xor_sync(0xffffffff, v[3], m, WARP_SIZE);
+        if (lane & m) {
+            v[0] = o0 - v[0]; v[1] = o1 - v[1]; v[2] = o2 - v[2]; v[3] = o3 - v[3];
+        } else {
+            v[0] += o0; v[1] += o1; v[2] += o2; v[3] += o3;
+        }
+    }
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    for (int l = 0; l < 4; ++l) {
+        v[l] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, 4*lane + l);
+    }
+
+    dst_t * out = y + ib*QK_TURBO5;
+    if constexpr (std::is_same_v<dst_t, float>) {
+        float2 * out2 = (float2 *) out;
+        out2[2*lane + 0] = make_float2(v[0], v[1]);   // coords 4*lane .. 4*lane+1
+        out2[2*lane + 1] = make_float2(v[2], v[3]);   // coords 4*lane+2 .. 4*lane+3
+    } else {
+        out[4*lane + 0] = ggml_cuda_cast<dst_t>(v[0]);
+        out[4*lane + 1] = ggml_cuda_cast<dst_t>(v[1]);
+        out[4*lane + 2] = ggml_cuda_cast<dst_t>(v[2]);
+        out[4*lane + 3] = ggml_cuda_cast<dst_t>(v[3]);
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_turbo5_cont_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k, cudaStream_t stream) {
+    const int64_t nb = k / QK_TURBO5;
+    dequantize_block_turbo5_cont<dst_t><<<(int) ((nb + WARP_SIZE - 1)/WARP_SIZE), WARP_SIZE, 0, stream>>>(vx, y, nb);
+}
+
+// rowwise variant (from_to / ggml_get_rows style strided rows): one warp per cache block
+template <typename dst_t>
+static __global__ void dequantize_block_turbo5_rowwise(const void * __restrict__ vx, dst_t * __restrict__ y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne0203, const uint3 ne02_fdv,
+        const int64_t s01, const int64_t s02, const int64_t s03) {
+    static_assert(QK_TURBO5 == 128, "turbo5 dequant kernel assumes QK_TURBO5 == 128");
+    const int64_t ib     = blockIdx.x;               // block-within-row index (grid.x == ne00/QK_TURBO5)
+    const int     lane   = threadIdx.x;              // blockDim == WARP_SIZE
+    const int64_t nb_per_row = ne00 / QK_TURBO5;
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            if (ib >= nb_per_row) {
+                continue;
+            }
+
+            const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02_fdv);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const int64_t ibx0 = i03*s03 + i02*s02 + i01*s01;   // strides are in block units
+            const block_turbo5_0 * blk = (const block_turbo5_0 *) vx + ibx0 + ib;
+
+            const float norm = __half2float(blk->norm);
+            const uint16_t seed = blk->seed;
+
+            const uint8_t q0 = blk->qs[2*lane + 0];
+            const uint8_t q1 = blk->qs[2*lane + 1];
+            const uint8_t sg = blk->signs[lane >> 1] >> (4*(lane & 1));
+
+            float v[4];
+            v[0] = turbo5_centroid((uint8_t) ((q0      & 0xF) | ((sg      & 1) << 4))) * norm;
+            v[1] = turbo5_centroid((uint8_t) ((q0      >>  4) | (((sg >> 1) & 1) << 4))) * norm;
+            v[2] = turbo5_centroid((uint8_t) ((q1      & 0xF) | (((sg >> 2) & 1) << 4))) * norm;
+            v[3] = turbo5_centroid((uint8_t) ((q1      >>  4) | (((sg >> 3) & 1) << 4))) * norm;
+
+            for (int l = 0; l < 4; ++l) {
+                v[l] *= ggml_turbo5_sign2(seed, 4*lane + l);
+            }
+            {
+                const float a0 = v[0], b0 = v[1], a2 = v[2], b2 = v[3];
+                v[0] = a0 + b0; v[1] = a0 - b0;
+                v[2] = a2 + b2; v[3] = a2 - b2;
+            }
+            {
+                const float a0 = v[0], a1 = v[1], b0 = v[2], b1 = v[3];
+                v[0] = a0 + b0; v[2] = a0 - b0;
+                v[1] = a1 + b1; v[3] = a1 - b1;
+            }
+#pragma unroll
+            for (int m = 1; m <= 16; m <<= 1) {
+                const float o0 = __shfl_xor_sync(0xffffffff, v[0], m, WARP_SIZE);
+                const float o1 = __shfl_xor_sync(0xffffffff, v[1], m, WARP_SIZE);
+                const float o2 = __shfl_xor_sync(0xffffffff, v[2], m, WARP_SIZE);
+                const float o3 = __shfl_xor_sync(0xffffffff, v[3], m, WARP_SIZE);
+                if (lane & m) {
+                    v[0] = o0 - v[0]; v[1] = o1 - v[1]; v[2] = o2 - v[2]; v[3] = o3 - v[3];
+                } else {
+                    v[0] += o0; v[1] += o1; v[2] += o2; v[3] += o3;
+                }
+            }
+
+            constexpr float inv_sqrt_128 = 0.08838834764831845f;
+            for (int l = 0; l < 4; ++l) {
+                v[l] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, 4*lane + l);
+            }
+
+            dst_t * yrow = y + (i0203*ne01 + i01)*ne00 + ib*QK_TURBO5;
+            yrow[4*lane + 0]        = ggml_cuda_cast<dst_t>(v[0]);
+            yrow[4*lane + 1]        = ggml_cuda_cast<dst_t>(v[1]);
+            yrow[4*lane + 2]        = ggml_cuda_cast<dst_t>(v[2]);
+            yrow[4*lane + 3]        = ggml_cuda_cast<dst_t>(v[3]);
+        }
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_turbo5_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    const int64_t ne0203 = ne02*ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const int64_t nb_per_row = ne00 / QK_TURBO5;
+    const dim3 num_blocks((int) std::min(nb_per_row, (int64_t) 65535), (int) std::min(ne01, (int64_t) 65535), (int) std::min(ne0203, (int64_t) 65535));
+    dequantize_block_turbo5_rowwise<dst_t><<<num_blocks, WARP_SIZE, 0, stream>>>(vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
 static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_Q8_0_NE_ALIGN - 1) / CUDA_Q8_0_NE_ALIGN;
     if (k % CUDA_Q8_0_NE_ALIGN == 0) {
@@ -512,7 +688,7 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
         case GGML_TYPE_TURBO5_0:
-            return dequantize_block_cont_cuda<QK_TURBO5, QR_TURBO5, dequantize_turbo5_0>;
+            return dequantize_row_turbo5_cont_cuda;  // per-block inverse FHT (see the kernel above)
         case GGML_TYPE_TURBO3Q_0:
             return dequantize_block_cont_cuda<QK_TURBO3Q, QR_TURBO3Q, dequantize_turbo3q_0>;
         case GGML_TYPE_TURBO4Q_0:
@@ -579,7 +755,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
         case GGML_TYPE_TURBO5_0:
-            return dequantize_block_cont_cuda<QK_TURBO5, QR_TURBO5, dequantize_turbo5_0>;
+            return dequantize_row_turbo5_cont_cuda;  // per-block inverse FHT (see the kernel above)
         case GGML_TYPE_TURBO3Q_0:
             return dequantize_block_cont_cuda<QK_TURBO3Q, QR_TURBO3Q, dequantize_turbo3q_0>;
         case GGML_TYPE_TURBO4Q_0:
@@ -649,7 +825,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cont_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
         case GGML_TYPE_TURBO5_0:
-            return dequantize_block_cont_cuda<QK_TURBO5, QR_TURBO5, dequantize_turbo5_0>;
+            return dequantize_row_turbo5_cont_cuda;  // per-block inverse FHT (see the kernel above)
         case GGML_TYPE_TURBO3Q_0:
             return dequantize_block_cont_cuda<QK_TURBO3Q, QR_TURBO3Q, dequantize_turbo3q_0>;
         case GGML_TYPE_TURBO4Q_0:
@@ -718,7 +894,7 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
         case GGML_TYPE_TURBO4_0:
             return dequantize_block_cuda<QK_TURBO4, QR_TURBO4, dequantize_turbo4_0>;
         case GGML_TYPE_TURBO5_0:
-            return dequantize_block_cuda<QK_TURBO5, QR_TURBO5, dequantize_turbo5_0>;
+            return dequantize_row_turbo5_cuda;  // per-block inverse FHT, rowwise strides
         case GGML_TYPE_TURBO3Q_0:
             return dequantize_block_cuda<QK_TURBO3Q, QR_TURBO3Q, dequantize_turbo3q_0>;
         case GGML_TYPE_TURBO4Q_0:

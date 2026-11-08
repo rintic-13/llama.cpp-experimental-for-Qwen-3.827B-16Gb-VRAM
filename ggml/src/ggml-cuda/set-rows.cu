@@ -851,6 +851,13 @@ static __global__ void k_set_rows_turbo4(
 // high bit -> signs[] (1 bit/element, 8 elements/byte).
 // Packing: qs uses warp-cooperative nibble pair write (even thread writes full byte);
 // signs use 8-lane shuffle gather per byte (like turbo3).
+//
+// 2026-11-08 per-block sign masks: the WHT frame of each block is its own signed Hadamard
+// G_b = D(s2_b)*H/sqrt(128)*D(s1_b) derived from a 16-bit seed stored in the block. The seed is
+// ggml_turbo5_seed_bits over the RAW fp32 bits of the block (shared helpers in ggml-common.h):
+// a commutative u64 sum, so this warp-shuffle reduction and the CPU reference codec derive the
+// identical seed from identical input bytes (CPU<->GPU byte mirror gate stays bit-exact).
+// turbo3/turbo4 keep the shared TURBO_WHT_SIGNS1/2 tables unchanged.
 
 template <typename idx_t, typename src_t>
 __launch_bounds__(128)
@@ -900,7 +907,30 @@ static __global__ void k_set_rows_turbo5(
     x[j] = src_row[i_blk * QK_TURBO5 + j];
     __syncthreads();
 
+    // ---- per-block seed from the RAW bits of x[] (before normalization) ----
+    // commutative u64 sum: warp-shuffle reduction + warp accumulators give every thread the
+    // same seed the CPU reference codec derives from the same 128 input floats.
     constexpr int n_warps = 128 / WARP_SIZE;
+    __shared__ uint64_t warp_h[n_warps];
+    {
+        const uint32_t raw_bits = *(const uint32_t *) &x[j];
+        uint64_t h = (uint64_t) raw_bits * (ggml_turbo5_sm64((uint64_t) j + 0x12345678ULL) | 1ULL);
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+            h += __shfl_xor_sync(0xffffffff, h, offset, WARP_SIZE);
+        if (j % WARP_SIZE == 0)
+            warp_h[j / WARP_SIZE] = h;
+    }
+    __syncthreads();
+
+    __shared__ uint16_t s_seed16;
+    if (j == 0) {
+        uint64_t total = 0;
+        for (int w = 0; w < n_warps; w++) total += warp_h[w];
+        s_seed16 = (uint16_t) (ggml_turbo5_sm64(total) >> 32);
+    }
+    __syncthreads();
+    const uint16_t seed16 = s_seed16;
+
     __shared__ float warp_accum[n_warps];
     float v  = x[j];
     float v2 = v * v;
@@ -923,7 +953,8 @@ static __global__ void k_set_rows_turbo5(
     x[j] *= inv_norm;
     __syncthreads();
 
-    x[j] *= TURBO_WHT_SIGNS1[j];
+    // per-block mask: D(s1_b) from the stored seed (was the shared TURBO_WHT_SIGNS1 table)
+    x[j] *= ggml_turbo5_sign1(seed16, j);
     __syncthreads();
 
     const int lane = j & 31;
@@ -953,9 +984,104 @@ static __global__ void k_set_rows_turbo5(
     __syncthreads();
 
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
-    x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
+    // per-block mask: D(s2_b) from the stored seed (was the shared TURBO_WHT_SIGNS2 table)
+    x[j] = x[j] * inv_sqrt_128 * ggml_turbo5_sign2(seed16, j);
     __syncthreads();
 
+    // ---- Quantize element j to 5-bit centroid (subtractive dither when enabled) ----
+#ifdef GGML_TURBO_SCALE_SEARCH
+    // [llama-tq encoder upgrade] mirror of k_set_rows_turbo4 above and of the CPU reference
+    //   codec (ggml-turbo-quant.c): 32 trial scales, per-trial warp-tree sums, thread 0 scans
+    //   k ascending with strict > (the exact nominal multiplier k=16 wins ties), the winner is
+    //   broadcast, element j is re-quantized at it, and the stored scalar is the unbiased scale
+    //   grp_norm / inner. Dither-free: dith_u is constant 0.0f for turbo5, kept in the operands
+    //   for structural symmetry with the 3/4-bit mirrors.
+    //   The sign-mask packing below is UNCHANGED: qs and signs both derive from the SAME
+    //   post-search idx each call (verified separately CPU<->GPU, incl. non-nominal winners).
+    const float xv = x[j];
+
+    __shared__ float warp_in [TURBO_N_TRIAL_SCALES][n_warps];
+    __shared__ float warp_rsq[TURBO_N_TRIAL_SCALES][n_warps];
+
+#pragma unroll
+    for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+        const uint8_t tidx = turbo_nearest_centroid_5bit(xv * TURBO_TRIAL_SCALE_INV[k] + dith_u);
+        const float   trec = TURBO_CENTROIDS_5BIT[tidx] - dith_u;
+
+        float w_in  = xv * trec;
+        float w_rsq = trec * trec;
+
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            w_in  += __shfl_xor_sync(0xffffffff, w_in,  offset, WARP_SIZE);
+            w_rsq += __shfl_xor_sync(0xffffffff, w_rsq, offset, WARP_SIZE);
+        }
+
+        if (j % WARP_SIZE == 0) {
+            warp_in[k][j / WARP_SIZE]  = w_in;
+            warp_rsq[k][j / WARP_SIZE] = w_rsq;
+        }
+    }
+    __syncthreads();
+
+    __shared__ float s_best_in;
+    __shared__ int   s_best_k;
+    if (j == 0) {
+        float best_in  = 0.0f;
+        float best_rsq = 0.0f;
+        int   best_k   = 16;
+
+        for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+            float inner = 0.0f, rsq = 0.0f;
+
+            for (int w = 0; w < n_warps; w++) {
+                inner += warp_in[k][w];
+                rsq   += warp_rsq[k][w];
+            }
+
+            if (inner <= 1e-10f) {
+                continue; // degenerate trial (zero block): never selected
+            }
+
+            if (best_in <= 0.0f || inner * inner * best_rsq > best_in * best_in * rsq) {
+                best_in  = inner;
+                best_rsq = rsq;
+                best_k   = k;
+            }
+        }
+
+        s_best_in = best_in;
+        s_best_k  = best_k;
+    }
+    __syncthreads();
+
+    // quantize element j at the winning scale (same operand order as the trial loop)
+    const uint8_t idx = turbo_nearest_centroid_5bit(xv * TURBO_TRIAL_SCALE_INV[s_best_k] + dith_u);
+
+    // ---- Pack qs: nibble packed, 2 elements per byte, even thread writes ----
+    const uint8_t my_nibble = idx & 0xF;
+    const uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
+    if (j % 2 == 0) {
+        blk->qs[j / 2] = my_nibble | (partner_nibble << 4);
+    }
+
+    // ---- Pack signs: 1 bit per element, 8 elements per byte ----
+    const uint8_t my_sign = (idx >> 4) & 1;
+    uint8_t signs_byte = 0;
+#pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        signs_byte |= (uint8_t) (__shfl_sync(0xffffffff, my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
+    }
+    if (lane % 8 == 0) {
+        blk->signs[j / 8] = signs_byte;
+    }
+
+    // ---- write the unbiased scale (one thread per block) ----
+    const float corrected_norm = (s_best_in > 1e-10f) ? grp_norm / s_best_in : grp_norm;
+    if (j == 0) {
+        blk->norm = __float2half(corrected_norm);
+        blk->seed = seed16;   // per-block mask seed: readers rebuild G_b from this
+    }
+#else
     // ---- Quantize element j to 5-bit centroid (subtractive dither when enabled) ----
     const uint8_t idx = turbo_nearest_centroid_5bit(x[j] + dith_u);
 
@@ -998,7 +1124,9 @@ static __global__ void k_set_rows_turbo5(
 
     if (j == 0) {
         blk->norm = __float2half(corrected_norm);
+        blk->seed = seed16;   // per-block mask seed (legacy branch: same seed as the search branch)
     }
+#endif
 }
 
 template<typename src_t, typename idx_t>
@@ -1849,8 +1977,6 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    ggml_cuda_kv_dump_rows(ctx, src0, dst);
-
     GGML_ASSERT(
         src0->type == GGML_TYPE_F32 ||
         (src0->type == GGML_TYPE_F16 && (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO5_0 ||
@@ -1872,4 +1998,10 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }
+
+    // DUMP hook runs AFTER the kernel: dst bytes captured post-write (previously this ran
+    // before the dispatch, so the KVG1 companion recorded the pre-write state - zeros for
+    // fresh cache rows - and every offline mirror byte-compare failed). src0 rows are read
+    // only, identical before and after; src1 (idx) is untouched by the kernels too.
+    ggml_cuda_kv_dump_rows(ctx, src0, dst);
 }

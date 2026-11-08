@@ -109,6 +109,21 @@ static inline bool llama_cache_type_is_turbo(enum ggml_type type) {
         || type == GGML_TYPE_TURBO4Q_0;
 }
 
+// 2026-11-08: turbo5 dropped the SHARED s1/s2 sign masks - every block is quantized in its own
+// signed Hadamard frame (16-bit seed inside the block) and every reader (FA vec dot / V dequant /
+// ggml cast kernels) applies the per-block inverse FHT, so dequantized turbo5 K/V and the FA
+// scores are already in the RAW (pre-rotation) domain.  The graph therefore applies NO rotation
+// chain to turbo5 sides: no Q pre-rotation, no output inverse, no signed matrices.  All graph /
+// attn_rot decisions that gate the shared-mask turbo behavior must use this predicate; the head
+// group requirement (n_embd_head % 128) still applies to turbo5 and stays on llama_cache_type_is_turbo.
+static inline bool llama_cache_type_is_turbo_shared(enum ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0
+        || type == GGML_TYPE_TURBO3_0
+        || type == GGML_TYPE_TURBO4_0
+        || type == GGML_TYPE_TURBO3Q_0
+        || type == GGML_TYPE_TURBO4Q_0;
+}
+
 // Prefetch the host pages needed to gather these rows.
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 

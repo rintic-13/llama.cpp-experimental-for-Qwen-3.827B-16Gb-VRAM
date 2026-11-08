@@ -455,25 +455,39 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
 // q8_1 word, pairing Q coord 4*k_KQ with K coord k_KQ and covering only D/4 elements (garbage
 // scores in the decode/vec path; PPL never hit it because prefill uses the MMA_F16 kernel).
 // Now mirrors vec_dot_fattn_vec_KQ_turbo4_0 exactly: one 4-coord q8_1 word per thread/iteration.
+//
+// 2026-11-08 per-block-mask redesign: each 128 K-block lives in its own signed Hadamard frame
+// G_b = D(s2_b)*H/sqrt(128)*D(s1_b) rebuilt from block.seed. The loop gives each lane the 4
+// contiguous elements j = 4*lane + a of one whole block per iteration, which is exactly the
+// lane-owned layout of a 128-point inverse FHT: in-thread butterflies for h=1,2 (pairs inside
+// the lane's own 4 elements), then __shfl_xor stages for h=4,16,32,64 (partner value of
+// j+/-h always sits in lane lane^(h/4), same a-offsets). The scores then use RAW K against the
+// RAW q8_1 Q (the graph no longer pre-rotates Q for turbo5) and sumc is the raw-domain ones-row
+// sum for the q8_1 zero-point correction.
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
     const int64_t /* k_ibase */) {
     GGML_UNUSED(Q_v);
+    static_assert(nthreads == WARP_SIZE, "turbo5 KQ dot runs the FHT as a warp shuffle tree");
 
     const block_turbo5_0 * K_turbo5_0 = (const block_turbo5_0 *) K_c;
+
+    const int lane = threadIdx.x;
 
     float sum = 0.0f;
 
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
-        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int k_KQ = k_KQ_0 + lane;
 
         const int ib   = k_KQ / (QK_TURBO5/4);
         const int iqs4 = k_KQ % (QK_TURBO5/4);
 
         const float norm = __half2float(K_turbo5_0[ib].norm);
+        const uint16_t seed = K_turbo5_0[ib].seed;
 
+        // unpack in the block's rotated G_b frame (normalized by norm, NOT yet raw)
         float c[4], sumc = 0.0f;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
@@ -481,8 +495,47 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo5_0(
             const uint8_t lo  = (K_turbo5_0[ib].qs   [j / 2] >> ((j % 2) * 4)) & 0xF;
             const uint8_t hi  = (K_turbo5_0[ib].signs[j / 8] >>  (j % 8))      & 0x1;
             c[l] = turbo5_centroid(lo | (hi << 4)) * norm;
-            sumc += c[l];
         }
+
+        // inverse FHT (G_b^-1 = D(s1) * (H/sqrt(128)) * D(s2) - stages in reverse order):
+        // the lane owns the contiguous j = 4*lane + a, so the h=1,2 butterflies pair INSIDE the
+        // lane's own four registers (4*lane is always the pair's first half), and h=4,8,16,32,64
+        // exchange whole 4-element groups with lane ^ m, m = h/4 (partner holds the same a set).
+        c[0] *= ggml_turbo5_sign2(seed, 4*lane + 0);
+        c[1] *= ggml_turbo5_sign2(seed, 4*lane + 1);
+        c[2] *= ggml_turbo5_sign2(seed, 4*lane + 2);
+        c[3] *= ggml_turbo5_sign2(seed, 4*lane + 3);
+
+        {   // h=1: pairs (4l, 4l+1) and (4l+2, 4l+3)
+            const float a0 = c[0], b0 = c[1], a2 = c[2], b2 = c[3];
+            c[0] = a0 + b0; c[1] = a0 - b0;
+            c[2] = a2 + b2; c[3] = a2 - b2;
+        }
+        {   // h=2: pairs (4l, 4l+2) and (4l+1, 4l+3)
+            const float a0 = c[0], a1 = c[1], b0 = c[2], b1 = c[3];
+            c[0] = a0 + b0; c[2] = a0 - b0;
+            c[1] = a1 + b1; c[3] = a1 - b1;
+        }
+#pragma unroll
+        for (int m = 1; m <= 16; m <<= 1) {   // h = 4*m
+            const float o0 = __shfl_xor_sync(0xffffffff, c[0], m, WARP_SIZE);
+            const float o1 = __shfl_xor_sync(0xffffffff, c[1], m, WARP_SIZE);
+            const float o2 = __shfl_xor_sync(0xffffffff, c[2], m, WARP_SIZE);
+            const float o3 = __shfl_xor_sync(0xffffffff, c[3], m, WARP_SIZE);
+            if (lane & m) {
+                c[0] = o0 - c[0]; c[1] = o1 - c[1]; c[2] = o2 - c[2]; c[3] = o3 - c[3];
+            } else {
+                c[0] += o0; c[1] += o1; c[2] += o2; c[3] += o3;
+            }
+        }
+
+        constexpr float inv_sqrt_128 = 0.08838834764831845f;
+        c[0] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, 4*lane + 0);
+        c[1] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, 4*lane + 1);
+        c[2] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, 4*lane + 2);
+        c[3] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, 4*lane + 3);
+
+        sumc = c[0] + c[1] + c[2] + c[3];
 
         const int    u    = Q_q8[k_KQ_0/nthreads];
         const int8_t * q8 = (const int8_t *) &u;
@@ -839,32 +892,84 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __rest
     }
 }
 
+// 2026-11-08 per-block-mask redesign: V rows are stored in per-block signed-Hadamard frames
+// G_b (seed in block.seed).  The vec kernel's V loop gives warp lane l exactly the block-relative
+// elements j = 4*l + a of one whole block per i_VKQ_0 iteration (nthreads_V == WARP_SIZE and
+// nthreads_V*V_rows_per_thread == QK_TURBO5 == 128, asserted in flash_attn_ext_vec), which is the
+// lane-owned layout of a warp-wide 128-point inverse FHT - the same scheme as
+// vec_dot_fattn_vec_KQ_turbo5_0 above (see its comment for the butterfly/shuffle pairing proof).
+// All 32 lanes of the warp execute every dequantize_V call (the V loop is warp-uniform), so the
+// shuffle tree is well-defined.  Output is RAW-domain (the graph applies no rotation chain for
+// turbo5 V).
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo5_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const int64_t /* v_ibase */) {
     const block_turbo5_0 * x = (const block_turbo5_0 *) vx;
 
     const int64_t ib = i0 / QK_TURBO5;
-    const int     j0 = i0 % QK_TURBO5;
+    const int     j0 = (int) (i0 % QK_TURBO5);
 
-    static_assert(ne == 2 || ne == 4, "bad ne");
-    const float norm = __half2float(x[ib].norm);
+    static_assert(ne == 4, "turbo5 V dequant needs 4 elements per lane (warp FHT layout)");
+    const float    norm = __half2float(x[ib].norm);
+    const uint16_t seed = x[ib].seed;
+    const int      lane = threadIdx.x;
 
+    // unpack in the block's rotated G_b frame
+    float v[4];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int j = j0 + l;
+        const uint8_t lo  = (x[ib].qs   [j / 2] >> ((j % 2) * 4)) & 0xF;
+        const uint8_t hi  = (x[ib].signs[j / 8] >>  (j % 8))      & 0x1;
+        v[l] = turbo5_centroid(lo | (hi << 4)) * norm;
+    }
+
+    // inverse FHT (G_b^-1 = D(s1) * (H/sqrt(128)) * D(s2), stages in reverse order):
+    // j0 = i0 % 128 == 4*lane, so h=1,2 pair inside the lane's own registers and h=4,8,16,32,64
+    // exchange whole 4-element groups with lane ^ m, m = h/4.
+    v[0] *= ggml_turbo5_sign2(seed, j0 + 0);
+    v[1] *= ggml_turbo5_sign2(seed, j0 + 1);
+    v[2] *= ggml_turbo5_sign2(seed, j0 + 2);
+    v[3] *= ggml_turbo5_sign2(seed, j0 + 3);
+
+    {   // h=1: pairs (4l, 4l+1) and (4l+2, 4l+3)
+        const float a0 = v[0], b0 = v[1], a2 = v[2], b2 = v[3];
+        v[0] = a0 + b0; v[1] = a0 - b0;
+        v[2] = a2 + b2; v[3] = a2 - b2;
+    }
+    {   // h=2: pairs (4l, 4l+2) and (4l+1, 4l+3)
+        const float a0 = v[0], a1 = v[1], b0 = v[2], b1 = v[3];
+        v[0] = a0 + b0; v[2] = a0 - b0;
+        v[1] = a1 + b1; v[3] = a1 - b1;
+    }
+#pragma unroll
+    for (int m = 1; m <= 16; m <<= 1) {   // h = 4*m
+        const float o0 = __shfl_xor_sync(0xffffffff, v[0], m, WARP_SIZE);
+        const float o1 = __shfl_xor_sync(0xffffffff, v[1], m, WARP_SIZE);
+        const float o2 = __shfl_xor_sync(0xffffffff, v[2], m, WARP_SIZE);
+        const float o3 = __shfl_xor_sync(0xffffffff, v[3], m, WARP_SIZE);
+        if (lane & m) {
+            v[0] = o0 - v[0]; v[1] = o1 - v[1]; v[2] = o2 - v[2]; v[3] = o3 - v[3];
+        } else {
+            v[0] += o0; v[1] += o1; v[2] += o2; v[3] += o3;
+        }
+    }
+
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    v[0] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, j0 + 0);
+    v[1] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, j0 + 1);
+    v[2] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, j0 + 2);
+    v[3] *= inv_sqrt_128 * ggml_turbo5_sign1(seed, j0 + 3);
+
+    static_assert(std::is_same_v<T, half> || std::is_same_v<T, float>, "bad type");
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
-#pragma unroll
-        for (int l0 = 0; l0 < ne; l0 += 2) {
-            ((half2 *) dst)[l0/2] = make_half2(turbo5_dequant_element(x + ib, j0 + l0 + 0, norm),
-                                                turbo5_dequant_element(x + ib, j0 + l0 + 1, norm));
-        }
+        ((half2 *) dst)[0] = __floats2half2_rn(v[0], v[1]);
+        ((half2 *) dst)[1] = __floats2half2_rn(v[2], v[3]);
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
-#pragma unroll
-        for (int l = 0; l < ne; ++l) {
-            ((float *) dst)[l] = turbo5_dequant_element(x + ib, j0 + l, norm);
-        }
-    } else {
-        static_assert(std::is_same_v<T, void>, "bad type");
+        ((float2 *) dst)[0] = make_float2(v[0], v[1]);
+        ((float2 *) dst)[1] = make_float2(v[2], v[3]);
     }
 }
 
@@ -1646,6 +1751,10 @@ void launch_fattn(
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
+    // 2026-11-08 NaN hunt (turbo5 ub>1 mmfa staging): optional peek at the f16 staging scratch.
+    // GGML_FATTN_DEBUG=1 only; skipped while a CUDA graph is being captured (memcpy/sync not allowed there).
+    static const bool fattn_dbg_stage = getenv("GGML_FATTN_DEBUG") != nullptr;
+
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
     size_t nb12 = K->nb[2];
@@ -1662,8 +1771,22 @@ void launch_fattn(
 
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
-        if (ggml_is_contiguously_allocated(K)) {
+        // The cont branch does a FLAT conversion and is chosen on ggml_is_contiguously_allocated() alone (a span
+        // check).  For unified-KV views the K/V slices are packed contiguously (nb2 = ne0*ts/bs, nb1 = ne2*nb2) so
+        // the span check legitimately passes, but the views are PERMUTED (nb1 > nb2, storage order [token][head]),
+        // and the flat turbo5 (bs=128) converter produced garbage on such a view in E1 (t5perblock_gate_20261108:
+        // nan=274/inf=1/max=65504 in the staged K_f16 - bytes misread as the f16 norm field, consistent with
+        // blocks walked with the old 82 B stride instead of the new 84 B one), followed by an all-NaN cascade.
+        // The nc strided launcher is correct for these views (proven path for every bs=32 quant; L1 2026-11-08:
+        // staged nan=0 inf=0 max<=10.8 for t5/t5 ub512, PPL unchanged).  Keep permuted views on the nc path;
+        // the flat converter for bs=128 KV views needs a dedicated GPU-vs-CPU dequant unit test before reuse.
+        if (ggml_is_contiguously_allocated(K) && !ggml_is_permuted(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            if (fattn_dbg_stage) {
+                GGML_LOG_WARN("FATTN_DEBUG: cont-stage K: type=%s ne={%d,%d,%d,%d} nb={%zu,%zu,%zu,%zu} bs=%zu ts=%zu nelem=%lld\n",
+                    ggml_type_name(K->type), (int) K->ne[0], (int) K->ne[1], (int) K->ne[2], (int) K->ne[3],
+                    K->nb[0], K->nb[1], K->nb[2], K->nb[3], bs, ts, (long long) ggml_nelements(K));
+            }
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
 
             nb11 = nb11*bs*sizeof(half)/ts;
@@ -1675,6 +1798,12 @@ void launch_fattn(
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
+            if (fattn_dbg_stage) {
+                GGML_LOG_WARN("FATTN_DEBUG: nc-stage K: type=%s ne={%d,%d,%d,%d} nb={%zu,%zu,%zu,%zu} bs=%zu ts=%zu s={%lld,%lld,%lld} cont=%d\n",
+                    ggml_type_name(K->type), (int) K->ne[0], (int) K->ne[1], (int) K->ne[2], (int) K->ne[3],
+                    K->nb[0], K->nb[1], K->nb[2], K->nb[3], bs, ts, (long long) s01, (long long) s02, (long long) s03,
+                    (int) ggml_is_contiguously_allocated(K));
+            }
             to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
 
             nb11 = K->ne[0] * sizeof(half);
@@ -1696,8 +1825,13 @@ void launch_fattn(
 
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
-            if (ggml_is_contiguously_allocated(V)) {
+            if (ggml_is_contiguously_allocated(V) && !ggml_is_permuted(V)) {  // see the K-stage note above
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                if (fattn_dbg_stage) {
+                    GGML_LOG_WARN("FATTN_DEBUG: cont-stage V: type=%s ne={%d,%d,%d,%d} nb={%zu,%zu,%zu,%zu} bs=%zu ts=%zu nelem=%lld\n",
+                        ggml_type_name(V->type), (int) V->ne[0], (int) V->ne[1], (int) V->ne[2], (int) V->ne[3],
+                        V->nb[0], V->nb[1], V->nb[2], V->nb[3], bs, ts, (long long) ggml_nelements(V));
+                }
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16;
 
@@ -1710,6 +1844,11 @@ void launch_fattn(
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
+                if (fattn_dbg_stage) {
+                    GGML_LOG_WARN("FATTN_DEBUG: nc-stage V: type=%s ne={%d,%d,%d,%d} nb={%zu,%zu,%zu,%zu} bs=%zu ts=%zu s={%lld,%lld,%lld}\n",
+                        ggml_type_name(V->type), (int) V->ne[0], (int) V->ne[1], (int) V->ne[2], (int) V->ne[3],
+                        V->nb[0], V->nb[1], V->nb[2], V->nb[3], bs, ts, (long long) s01, (long long) s02, (long long) s03);
+                }
                 to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
 
                 nb21 = V->ne[0] * sizeof(half);
@@ -1717,6 +1856,37 @@ void launch_fattn(
                 nb23 = V->ne[2] * nb22;
             }
             V_data = (char *) V_f16;
+        }
+    }
+
+    if (fattn_dbg_stage) {
+        cudaStreamCaptureStatus dbg_cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(main_stream, &dbg_cap);
+        if (dbg_cap == cudaStreamCaptureStatusNone) {
+            static std::vector<half> dbg_hbuf;
+            auto dbg_stage_stats = [&](const char * name, const half * ptr, const ggml_tensor * src) {
+                const size_t n = (size_t) ggml_nelements(src);
+                dbg_hbuf.resize(n < 32768 ? n : 32768);
+                cudaMemcpyAsync(dbg_hbuf.data(), ptr, dbg_hbuf.size()*sizeof(half), cudaMemcpyDeviceToHost, main_stream);
+                cudaStreamSynchronize(main_stream);
+                size_t dbg_nan = 0, dbg_inf = 0; float dbg_max = 0.0f;
+                for (const half & hv : dbg_hbuf) {
+                    const float f = __half2float(hv);
+                    if (std::isnan(f)) { ++dbg_nan; continue; }
+                    if (std::isinf(f)) { ++dbg_inf; continue; }
+                    if (std::abs(f) > dbg_max) dbg_max = std::abs(f);
+                }
+                GGML_LOG_WARN("FATTN_DEBUG: staged %s_f16 src=%s ne={%d,%d,%d,%d} sample=%zu nan=%zu inf=%zu max=%.4f vals=[%.5g %.5g %.5g %.5g]\n",
+                    name, ggml_type_name(src->type), (int) src->ne[0], (int) src->ne[1], (int) src->ne[2], (int) src->ne[3],
+                    dbg_hbuf.size(), dbg_nan, dbg_inf, dbg_max,
+                    __half2float(dbg_hbuf[0]), __half2float(dbg_hbuf[1]), __half2float(dbg_hbuf[2]), __half2float(dbg_hbuf[3]));
+            };
+            if (need_f16_K && K->type != GGML_TYPE_F16 && f16_extra.K != 0) {
+                dbg_stage_stats("K", (const half *) f16_extra.K, K);
+            }
+            if (need_f16_V && V->type != GGML_TYPE_F16 && !V_is_K_view && f16_extra.V != 0) {
+                dbg_stage_stats("V", (const half *) f16_extra.V, V);
+            }
         }
     }
 

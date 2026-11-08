@@ -161,9 +161,7 @@ GGML_API void ggml_turbo_wht_signs(const float ** s1, const float ** s2) {
 
 /* ---------- CPU forward WHT (in-place, 128-element groups) ---------- */
 
-static void turbo_cpu_fwht(float * x, int group_size) {
-    const float * s1 = turbo_cpu_s1;
-    const float * s2 = turbo_cpu_s2;
+static void turbo_cpu_fwht_masked(float * x, int group_size, const float * s1, const float * s2) {
     const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
 
     // signs1
@@ -184,6 +182,10 @@ static void turbo_cpu_fwht(float * x, int group_size) {
     for (int i = 0; i < group_size; i++) x[i] *= inv_sqrt * s2[i];
 }
 
+static void turbo_cpu_fwht(float * x, int group_size) {
+    turbo_cpu_fwht_masked(x, group_size, turbo_cpu_s1, turbo_cpu_s2);
+}
+
 /* ---------- CPU inverse WHT (in-place, 128-element groups) ----------
  *
  * Forward is  y = D(s2) * N * H * D(s1) * x   (N = 1/sqrt(group_size))
@@ -192,10 +194,7 @@ static void turbo_cpu_fwht(float * x, int group_size) {
  * The inverse therefore has the same structure with s1 and s2 swapped:
  *     x = D(s1) * N * H * D(s2) * y
  */
-GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
-GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
-    const float * s1 = turbo_cpu_s1;
-    const float * s2 = turbo_cpu_s2;
+static void turbo_cpu_fwht_inverse_masked(float * x, int group_size, const float * s1, const float * s2) {
     const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
 
     // signs2 (undoes the s2 that was applied last in the forward pass)
@@ -214,6 +213,11 @@ GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
 
     // normalize + signs1
     for (int i = 0; i < group_size; i++) x[i] *= inv_sqrt * s1[i];
+}
+
+GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
+GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
+    turbo_cpu_fwht_inverse_masked(x, group_size, turbo_cpu_s1, turbo_cpu_s2);
 }
 
 /* ---------- TURBO2_0: 2-bit PolarQuant ---------- */
@@ -503,7 +507,15 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
     }
 }
 
-/* ---------- TURBO5_0: 5-bit PolarQuant (no QJL, no rnorm) ---------- */
+/* ---------- TURBO5_0: 5-bit PolarQuant (no QJL, no rnorm), per-block sign masks ----------
+ * 2026-11-08: turbo5 dropped the shared turbo s1/s2 sign masks (KV_MASK_CORRELATION_20261108
+ * measured the shared mask aligning reconstruction errors across blocks: channel bias 1.26x,
+ * attention-score coherence 1.14 vs 0.68 for per-block masks - while MSE is identical).
+ * Each block is now quantized in its own frame G_b = D(s2_b)*H/sqrt(128)*D(s1_b) derived from a
+ * 16-bit seed stored in the block; the seed is a commutative integer hash of the raw block bits,
+ * so a CPU and a CUDA writer that read identical input bytes pick identical masks (the CPU<->GPU
+ * byte mirror gate stays bit-exact). Readers apply G_b^-1 with the stored seed and return RAW
+ * values, so the graph does not rotate Q/output for turbo5 (see llama-kv-cache.cpp). */
 
 GGML_API void quantize_row_turbo5_0_ref(const float * GGML_RESTRICT x, block_turbo5_0 * GGML_RESTRICT y, int64_t k);
 void quantize_row_turbo5_0_ref(const float * GGML_RESTRICT x, block_turbo5_0 * GGML_RESTRICT y, int64_t k) {
@@ -519,11 +531,69 @@ void quantize_row_turbo5_0_ref(const float * GGML_RESTRICT x, block_turbo5_0 * G
             buf[j] = x[b * QK_TURBO5 + j];
             norm_sq += buf[j] * buf[j];
         }
+
+        // per-block seed from the raw bits (commutative u64 sum - order- and engine-independent)
+        uint32_t raw_bits[QK_TURBO5];
+        memcpy(raw_bits, x + b * QK_TURBO5, QK_TURBO5 * sizeof(float));
+        const uint16_t seed = ggml_turbo5_seed_bits(raw_bits);
+        y[b].seed = seed;
+
         grp_norm = sqrtf(norm_sq);
         const float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
         for (int j = 0; j < QK_TURBO5; j++) buf[j] *= inv_norm;
-        turbo_cpu_fwht(buf, QK_TURBO5);
 
+        float s1b[QK_TURBO5], s2b[QK_TURBO5];
+        for (int j = 0; j < QK_TURBO5; j++) {
+            s1b[j] = ggml_turbo5_sign1(seed, j);
+            s2b[j] = ggml_turbo5_sign2(seed, j);
+        }
+        turbo_cpu_fwht_masked(buf, QK_TURBO5, s1b, s2b);
+
+        // 5-bit index split: low 4 bits in qs[] (nibble packed), high bit in signs[]
+#ifdef GGML_TURBO_SCALE_SEARCH
+        // [llama-tq encoder upgrade] see the TURBO3_0 path above - identical algorithm at 5 bits,
+        // dither-free (turbo5 carries no subtractive dither by design, CPU and CUDA behave the
+        // same). CPU+GPU-row prototype (KV_OUTLIERS_20261107): aggregate relL2 K 0.0509 -> 0.0440,
+        // V 0.0495 -> 0.0434; worst-row relL2 beats q5_1 (K 0.0930 -> 0.0515 vs q5_1 0.0583,
+        // V 0.0932 -> 0.0515 vs 0.0607), median loses ~5% to q5_1 - the exact profile that won
+        // the 4-bit PPL gate (turbo4 vs q4_1). The trial search runs in the block's own G_b frame.
+        float best_in  = 0.0f;
+        float best_rsq = 0.0f;
+        int   best_k   = 16;
+
+        for (int k = 0; k < TURBO_N_TRIAL_SCALES; k++) {
+            float inner = 0.0f, rsq = 0.0f;
+            for (int j = 0; j < QK_TURBO5; j++) {
+                const int   idx = nearest_centroid_5bit(buf[j] * TURBO_TRIAL_SCALE_INV[k]);
+                const float rec = CENTROIDS_5BIT[idx];
+                inner += buf[j] * rec;
+                rsq   += rec * rec;
+            }
+
+            if (inner <= 1e-10f) {
+                continue; // degenerate trial (zero block): never selected
+            }
+
+            if (best_in <= 0.0f || inner * inner * best_rsq > best_in * best_in * rsq) {
+                best_in = inner;
+                best_rsq = rsq;
+                best_k  = k;
+            }
+        }
+
+        memset(y[b].qs,    0, QK_TURBO5 / 2);
+        memset(y[b].signs, 0, QK_TURBO5 / 8);
+        for (int j = 0; j < QK_TURBO5; j++) {
+            const int idx = nearest_centroid_5bit(buf[j] * TURBO_TRIAL_SCALE_INV[best_k]);
+            y[b].qs[j / 2]    |= (uint8_t)((idx & 0xF) << ((j % 2) * 4));
+            y[b].signs[j / 8] |= (uint8_t)(((idx >> 4) & 0x1) << (j % 8));
+        }
+
+        // unbiased scale computed in the G_b frame; c(idx) and the stored norm together describe
+        // the rotated-domain sample, and G_b^-1 (applied by every reader) carries it to the raw one.
+        const float corrected = (best_in > 1e-10f) ? grp_norm / best_in : grp_norm;
+        y[b].norm = GGML_FP32_TO_FP16(corrected);
+#else
         // 5-bit index split: low 4 bits in qs[] (nibble packed), high bit in signs[]
         float recon_sq = 0.0f;
         memset(y[b].qs,    0, QK_TURBO5 / 2);
@@ -538,6 +608,7 @@ void quantize_row_turbo5_0_ref(const float * GGML_RESTRICT x, block_turbo5_0 * G
         const float recon_norm = sqrtf(recon_sq);
         const float corrected  = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
         y[b].norm = GGML_FP32_TO_FP16(corrected);
+#endif
     }
 }
 
@@ -545,7 +616,8 @@ GGML_API void dequantize_row_turbo5_0(const block_turbo5_0 * GGML_RESTRICT x, fl
 void dequantize_row_turbo5_0(const block_turbo5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO5 == 0);
     const int nb = (int)(k / QK_TURBO5);
-    // No inverse WHT here: dequant stays in the rotated domain
+    // Unpack in the block's rotated G_b frame, then undo G_b with the stored seed:
+    // dequant returns RAW (pre-rotation) values (2026-11-08 per-block-mask redesign).
     for (int block = 0; block < nb; block++) {
         const float norm = GGML_FP16_TO_FP32(x[block].norm);
         for (int j = 0; j < QK_TURBO5; j++) {
@@ -554,6 +626,12 @@ void dequantize_row_turbo5_0(const block_turbo5_0 * GGML_RESTRICT x, float * GGM
             const uint8_t idx = lo | (hi << 4);
             y[block * QK_TURBO5 + j] = CENTROIDS_5BIT[idx] * norm;
         }
+        float s1b[QK_TURBO5], s2b[QK_TURBO5];
+        for (int j = 0; j < QK_TURBO5; j++) {
+            s1b[j] = ggml_turbo5_sign1(x[block].seed, j);
+            s2b[j] = ggml_turbo5_sign2(x[block].seed, j);
+        }
+        turbo_cpu_fwht_inverse_masked(y + block * QK_TURBO5, QK_TURBO5, s1b, s2b);
     }
 }
 

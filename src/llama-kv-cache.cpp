@@ -342,11 +342,14 @@ llama_kv_cache::llama_kv_cache(
         // nvfp4 is quantized but has no rotation anywhere in the codec (Stage A writes raw,
         // unrotated rows - the probe showed raw beats WHT-rotated on real K/V: 0.8715 vs 0.9076 K).
         // Exclude it here so the plain Hadamard graph rotator stays off.
+        // turbo5 (2026-11-08 per-block masks) is the same case for the GRAPH: the codec rotation
+        // is per-block and every reader undoes it, so K/V/scores are already raw - no graph chain.
         attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
             type_k != GGML_TYPE_NVFP4 &&
+            type_k != GGML_TYPE_TURBO5_0 &&
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
@@ -361,21 +364,25 @@ llama_kv_cache::llama_kv_cache(
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
             type_v != GGML_TYPE_NVFP4 &&
+            type_v != GGML_TYPE_TURBO5_0 &&
             hparams.n_embd_head_v() % 64 == 0;
     }
 
     // turbo cache types rotate K/V inside the set_rows block codec (WHT group 128 with the s1/s2
     // signs) - the graph-side signed counterpart matrices are mandatory, not optional, and the
-    // LLAMA_ATTN_ROT_DISABLE escape hatch must not turn them off
+    // LLAMA_ATTN_ROT_DISABLE escape hatch must not turn them off.
+    // turbo5 is excluded: its codec rotation is PER-BLOCK and reader-side undone (raw domain),
+    // so it must not get the shared signed matrices / Q pre-rotation / output inverse (see
+    // llama-impl.h llama_cache_type_is_turbo_shared).
     if (llama_cache_type_is_turbo(type_k) || llama_cache_type_is_turbo(type_v)) {
         if (hparams.n_embd_head_k() % 128 != 0 || hparams.n_embd_head_v() % 128 != 0) {
             GGML_ABORT("%s: turbo cache types require head_dim %% 128 == 0 (K head %d, V head %d)\n",
                     __func__, hparams.n_embd_head_k(), hparams.n_embd_head_v());
         }
-        if (llama_cache_type_is_turbo(type_k)) {
+        if (llama_cache_type_is_turbo_shared(type_k)) {
             attn_rot_k = true;
         }
-        if (llama_cache_type_is_turbo(type_v)) {
+        if (llama_cache_type_is_turbo_shared(type_v)) {
             attn_rot_v = true;
         }
     }
@@ -404,11 +411,13 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // signed Hadamard matrices for the turbo cache types (fixed WHT group of 128, see ggml-turbo-quant.c):
+    // signed Hadamard matrices for the shared-mask turbo cache types (fixed WHT group of 128, see
+    // ggml-turbo-quant.c).  turbo5 is NOT included (2026-11-08 per-block masks: readers already
+    // return the raw domain, the graph applies no rotation for it):
     //   fwd = D(s2) * H/sqrt(n) * D(s1)  - applied to Q so scores match the codec-rotated K
     //   inv = D(s1) * H/sqrt(n) * D(s2)  - applied to the attention output to undo the codec-rotated V
     // note: fwd * inv == I, both are orthonormal
-    if (llama_cache_type_is_turbo(type_k) || llama_cache_type_is_turbo(type_v)) {
+    if (llama_cache_type_is_turbo_shared(type_k) || llama_cache_type_is_turbo_shared(type_v)) {
         const int64_t n = 128;
 
         const float * s1;

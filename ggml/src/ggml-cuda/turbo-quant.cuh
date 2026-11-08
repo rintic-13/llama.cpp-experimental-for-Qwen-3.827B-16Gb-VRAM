@@ -560,6 +560,9 @@ static __device__ __forceinline__ float turbo4_dequant_element(
     return turbo4_centroid(idx) * norm;
 }
 
+// 2026-11-08: unused element-wise turbo5 helpers (rotated-domain, shared-mask era).  Kept for
+// reference only - the live readers are the per-block inverse-FHT kernels (convert.cu
+// dequantize_block_turbo5_cont/rowwise, fattn-common.cuh KQ dot / dequantize_V_turbo5_0).
 static __device__ __forceinline__ float turbo5_dequant_element(
         const block_turbo5_0 * __restrict__ x, int j, float norm) {
     const uint8_t lo  = (x->qs[j / 2] >> ((j % 2) * 4)) & 0xF;
